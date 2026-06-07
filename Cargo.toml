@@ -1,0 +1,37 @@
+[package]
+name = "dtoo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+glob = "0.3"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+indicatif = "0.17"
+comfy-table = "7"
+aes-gcm = "0.10"
+aes = "0.8"
+ecb = "0.1"
+sha1 = "0.10"
+base64 = "0.22"
+polars = { version = "0.54.4", features = ["lazy", "sql", "csv", "parquet", "json", "strings", "dtype-full", "diagonal_concat"] }
+calamine = "0.35.0"
+flate2 = "1.1.9"
+zstd = "0.13.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[dev-dependencies]
+rust_xlsxwriter = "0.95.0"
