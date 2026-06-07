@@ -59,27 +59,33 @@ impl SchemaManager {
     }
 }
 
-/// Map a DuckDB-style type string to a Polars [`DataType`].
+/// Parse a Polars dtype name from a `--schema` file into a [`DataType`].
 ///
-/// Case-insensitive; tolerates `DECIMAL(p,s)` and `NUMERIC(p,s)` parameterised forms.
-/// Returns [`DtooError::Schema`] for unknown or unsupported type names.
-pub fn duckdb_type_to_polars(data_type: &str) -> Result<DataType, DtooError> {
+/// Type names are the Polars dtype names (case-insensitive): `Int8`/`Int16`/`Int32`/
+/// `Int64`, `UInt8`/`UInt16`/`UInt32`/`UInt64`, `Float32`/`Float64`, `Boolean`,
+/// `String`, `Date`, `Datetime`, `Time`, and `Decimal(p,s)`. A bare `Decimal`
+/// defaults to `Decimal(18, 3)`. Returns [`DtooError::Schema`] for unknown names.
+pub fn parse_schema_type(data_type: &str) -> Result<DataType, DtooError> {
     let upper = data_type.trim().to_ascii_uppercase();
     let base = upper.split('(').next().unwrap_or("").trim();
     let dt = match base {
-        "INTEGER" | "INT" | "INT4" => DataType::Int32,
-        "BIGINT" | "INT8" | "LONG" => DataType::Int64,
-        "SMALLINT" | "INT2" => DataType::Int16,
-        "TINYINT" => DataType::Int8,
-        "DOUBLE" | "FLOAT8" => DataType::Float64,
-        "REAL" | "FLOAT" | "FLOAT4" => DataType::Float32,
-        "BOOLEAN" | "BOOL" => DataType::Boolean,
-        "VARCHAR" | "TEXT" | "STRING" | "CHAR" => DataType::String,
+        "INT8" => DataType::Int8,
+        "INT16" => DataType::Int16,
+        "INT32" => DataType::Int32,
+        "INT64" => DataType::Int64,
+        "UINT8" => DataType::UInt8,
+        "UINT16" => DataType::UInt16,
+        "UINT32" => DataType::UInt32,
+        "UINT64" => DataType::UInt64,
+        "FLOAT32" => DataType::Float32,
+        "FLOAT64" => DataType::Float64,
+        "BOOLEAN" => DataType::Boolean,
+        "STRING" => DataType::String,
         "DATE" => DataType::Date,
-        "TIMESTAMP" | "DATETIME" => DataType::Datetime(TimeUnit::Microseconds, None),
-        "DECIMAL" | "NUMERIC" => {
+        "DATETIME" => DataType::Datetime(TimeUnit::Microseconds, None),
+        "TIME" => DataType::Time,
+        "DECIMAL" => {
             let (p, s) = parse_decimal_params(&upper);
-            // DuckDB bare DECIMAL defaults to DECIMAL(18,3); explicit params override.
             DataType::Decimal(p.unwrap_or(18), s.unwrap_or(3))
         }
         _ => {
@@ -125,7 +131,7 @@ pub fn coerce_to_schema(lf: LazyFrame, columns: &[SchemaColumn]) -> Result<LazyF
 
     let mut exprs: Vec<Expr> = Vec::with_capacity(columns.len());
     for c in columns {
-        let dt = duckdb_type_to_polars(&c.data_type)?;
+        let dt = parse_schema_type(&c.data_type)?;
         let e = if let Some(actual) = lower_to_actual.get(&c.name.to_ascii_lowercase()) {
             col(actual.as_str()).cast(dt).alias(c.name.as_str())
         } else {
@@ -174,7 +180,7 @@ fn load_explicit_schema(path: &Path) -> Result<ExplicitSchema, DtooError> {
             });
         }
 
-        if !is_valid_duckdb_identifier(name) {
+        if !is_valid_column_identifier(name) {
             return Err(DtooError::Schema {
                 message: format!("invalid column name `{name}`"),
             });
@@ -196,7 +202,7 @@ fn load_explicit_schema(path: &Path) -> Result<ExplicitSchema, DtooError> {
     Ok(ExplicitSchema { columns })
 }
 
-fn is_valid_duckdb_identifier(name: &str) -> bool {
+fn is_valid_column_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -241,13 +247,19 @@ mod tests {
     }
 
     #[test]
-    fn duckdb_type_maps_to_polars() {
+    fn schema_type_maps_to_polars() {
         use polars::prelude::*;
-        assert_eq!(duckdb_type_to_polars("INTEGER").unwrap(), DataType::Int32);
-        assert_eq!(duckdb_type_to_polars("BIGINT").unwrap(), DataType::Int64);
-        assert_eq!(duckdb_type_to_polars("VARCHAR").unwrap(), DataType::String);
-        assert_eq!(duckdb_type_to_polars("BOOLEAN").unwrap(), DataType::Boolean);
-        assert!(duckdb_type_to_polars("NOPE_TYPE").is_err());
+        assert_eq!(parse_schema_type("Int32").unwrap(), DataType::Int32);
+        assert_eq!(parse_schema_type("Int64").unwrap(), DataType::Int64);
+        assert_eq!(parse_schema_type("String").unwrap(), DataType::String);
+        assert_eq!(parse_schema_type("Boolean").unwrap(), DataType::Boolean);
+        assert_eq!(parse_schema_type("Float64").unwrap(), DataType::Float64);
+        // Case-insensitive.
+        assert_eq!(parse_schema_type("int64").unwrap(), DataType::Int64);
+        // DuckDB/SQL names are no longer accepted.
+        assert!(parse_schema_type("VARCHAR").is_err());
+        assert!(parse_schema_type("INTEGER").is_err());
+        assert!(parse_schema_type("NOPE_TYPE").is_err());
     }
 
     #[test]
@@ -258,11 +270,11 @@ mod tests {
         let cols = vec![
             SchemaColumn {
                 name: "id".into(),
-                data_type: "INTEGER".into(),
+                data_type: "Int32".into(),
             },
             SchemaColumn {
                 name: "name".into(),
-                data_type: "VARCHAR".into(),
+                data_type: "String".into(),
             },
         ];
         let out = coerce_to_schema(lf, &cols).unwrap().collect().unwrap();
@@ -286,7 +298,7 @@ mod tests {
         let lf = df!["Name" => ["alice"]].unwrap().lazy();
         let cols = vec![SchemaColumn {
             name: "name".into(),
-            data_type: "VARCHAR".into(),
+            data_type: "String".into(),
         }];
         let out = coerce_to_schema(lf, &cols).unwrap().collect().unwrap();
         let col_name = out.column("name").expect("output column 'name' must exist");
@@ -301,17 +313,17 @@ mod tests {
     #[test]
     fn decimal_bare_defaults_to_18_3() {
         use polars::prelude::*;
-        // Bare DECIMAL (no params) must default to DuckDB's DECIMAL(18,3).
+        // Bare Decimal (no params) defaults to Decimal(18,3).
         assert_eq!(
-            duckdb_type_to_polars("DECIMAL").unwrap(),
+            parse_schema_type("Decimal").unwrap(),
             DataType::Decimal(18, 3),
-            "bare DECIMAL must map to Decimal(18,3)"
+            "bare Decimal must map to Decimal(18,3)"
         );
-        // Explicit DECIMAL(10,2) must not be overridden.
+        // Explicit Decimal(10,2) must not be overridden.
         assert_eq!(
-            duckdb_type_to_polars("DECIMAL(10,2)").unwrap(),
+            parse_schema_type("Decimal(10,2)").unwrap(),
             DataType::Decimal(10, 2),
-            "explicit DECIMAL(10,2) must map to Decimal(10,2)"
+            "explicit Decimal(10,2) must map to Decimal(10,2)"
         );
     }
 

@@ -10,11 +10,11 @@ A Rust CLI tool for data engineers to query, profile, and transform data across 
 
 ### SQL Surface Limitations
 
-User-facing SQL (`--where`, `--filter-sql`, `--post-sql`, reference-table JOINs) runs on Polars `SQLContext`:
+User-facing SQL (`--where`, `--filter-sql`, `--post-sql`, reference-table JOINs) runs on Polars `SQLContext`. Compared to DuckDB, the SQL surface is narrower:
 
 - **`DELETE` / `UPDATE` statements are treated as transforms**, not mutations. For example, `DELETE FROM _ WHERE x` drops matching rows and returns a result set rather than raising an error. Do not rely on DML semantics in `--post-sql`.
 - **Window functions** (`OVER (PARTITION BY … ORDER BY …)`) have known correctness issues in Polars SQL. Avoid them; dtoo does not attempt to detect or warn about their use.
-- **Narrower function library**: some exotic date, regex, and string functions are absent. Unsupported SQL returns a clear error (it never silently hangs — which was the motivation for the migration).
+- **Narrower function library**: some exotic DuckDB date, regex, and string functions are absent. Unsupported SQL returns a clear error (it never silently hangs — which was the motivation for the migration).
 - Errors are always explicit `Result` values; the engine never hangs on malformed input.
 
 ---
@@ -222,18 +222,18 @@ find . -name "*.xlsx" | dtoo query --pipe file --sheet "Data"
 
 **Explicit (--schema):** Schema file defines the target columns and types. Files are coerced to match. Extra columns in source files are ignored; missing columns become NULL.
 
-Schema file format (YAML). Type strings use DuckDB-style names (e.g. `INTEGER`, `VARCHAR`, `DECIMAL(10,2)`, `TIMESTAMP`) which are mapped to Polars dtypes at load time. Bare `DECIMAL` defaults to `DECIMAL(18,3)`.
+Schema file format (YAML). Type names are Polars dtype names (case-insensitive): `Int8`/`Int16`/`Int32`/`Int64`, `UInt8`/`UInt16`/`UInt32`/`UInt64`, `Float32`/`Float64`, `Boolean`, `String`, `Date`, `Datetime`, `Time`, and `Decimal(p,s)`. A bare `Decimal` defaults to `Decimal(18,3)`.
 
 ```yaml
 columns:
   - name: id
-    type: INTEGER
+    type: Int64
   - name: name
-    type: VARCHAR
+    type: String
   - name: amount
-    type: DECIMAL(10,2)
+    type: Decimal(10,2)
   - name: created_at
-    type: TIMESTAMP
+    type: Datetime
 ```
 
 ### Where + Filter-SQL Interaction
