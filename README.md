@@ -1,5 +1,3 @@
-<img src="docs/logo.png" alt="dtoo" height="96" align="left" hspace="16" />
-
 <h3>dtoo</h3>
 
 [![CI](https://img.shields.io/github/actions/workflow/status/neural-chilli/dtoo/ci.yml?label=CI&logo=github)](https://github.com/neural-chilli/dtoo/actions)
