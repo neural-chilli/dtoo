@@ -8,7 +8,7 @@
 
 A fast, ergonomic CLI tool for data engineers. Query across file trees using SQL, profile data, add lineage, and more.
 
-Built in Rust on top of DuckDB.
+Built in Rust.
 
 ## Quick Start
 
