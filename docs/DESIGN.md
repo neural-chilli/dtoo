@@ -570,7 +570,6 @@ Everything described above. **Cloud storage (S3, GCS, Azure) is deferred** in th
 
 | | Open Source | Pro | Enterprise |
 |---|---|---|---|
-| **Price** | Free | ~$30/user/month | Custom |
 | Core query/transform | Yes | Yes | Yes |
 | Profile/inspect/fingerprint | Yes | Yes | Yes |
 | Lineage, masking, pipe mode | Yes | Yes | Yes |
