@@ -28,6 +28,5 @@ target
 
 /testdata
 /out/
-/docs/
 AGENTS.md
 CLAUDE.md
