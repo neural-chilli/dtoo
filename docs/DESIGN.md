@@ -575,6 +575,7 @@ Everything described above. **Cloud storage (S3, GCS, Azure) is deferred** in th
 | Lineage, masking, pipe mode | Yes | Yes | Yes |
 | Cloud storage (S3/GCS/Azure) | Deferred | Deferred | Deferred |
 | Config files, manifests | Yes | Yes | Yes |
+| Synthetic data generation | Yes | Yes | Yes |
 | Data quality assertions | - | Yes | Yes |
 | Incremental processing | - | Yes | Yes |
 | Schema drift detection | - | Yes | Yes |
