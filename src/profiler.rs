@@ -13,6 +13,9 @@ use crate::{
     error::DtooError,
 };
 
+/// Value of [`ProfileReport::detail`] when a profile was generated at synth detail.
+pub const SYNTH_DETAIL: &str = "synth";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValueFrequency {
     pub value: String,
@@ -99,6 +102,12 @@ impl Profiler {
             });
         }
 
+        if options.detail == ProfileDetail::Synth && options.format != ProfileFormat::Json {
+            return Err(DtooError::Config {
+                message: "synth profile detail requires JSON profile format".to_string(),
+            });
+        }
+
         let sampled: DataFrame;
         let source: &DataFrame = if options.sample_percentage < 100 {
             let n = ((df.height() as f64 * options.sample_percentage as f64 / 100.0).round()
@@ -109,12 +118,6 @@ impl Profiler {
         } else {
             df
         };
-
-        if options.detail == ProfileDetail::Synth && options.format != ProfileFormat::Json {
-            return Err(DtooError::Config {
-                message: "--detail synth requires JSON profile format".to_string(),
-            });
-        }
 
         let report = build_report(
             source,
@@ -146,7 +149,7 @@ fn build_report(
         sample_percentage,
         generated_at: Utc::now().to_rfc3339(),
         columns,
-        detail: (detail == ProfileDetail::Synth).then(|| "synth".to_string()),
+        detail: (detail == ProfileDetail::Synth).then(|| SYNTH_DETAIL.to_string()),
         correlation_matrix: None,
     })
 }
