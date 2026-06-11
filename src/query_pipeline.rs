@@ -557,6 +557,8 @@ impl<'a> QueryPipelineRunner<'a> {
                 path: profile_path.clone(),
                 format: self.args.profile_format,
                 sample_percentage: self.args.profile_sample,
+                detail: crate::cli::ProfileDetail::Standard,
+                top_k: 1000,
             },
         )
     }

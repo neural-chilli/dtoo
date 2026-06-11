@@ -6,17 +6,35 @@ use std::{
 
 use chrono::Utc;
 use polars::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::{cli::ProfileFormat, error::DtooError};
+use crate::{
+    cli::{ProfileDetail, ProfileFormat},
+    error::DtooError,
+};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValueFrequency {
     pub value: String,
     pub freq: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
+/// One bucket of a quantile-spaced histogram over a column's physical values.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistogramBucket {
+    pub lo: f64,
+    pub hi: f64,
+    pub count: u64,
+}
+
+/// Pairwise Spearman correlation matrix over numeric/temporal columns.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CorrelationMatrix {
+    pub columns: Vec<String>,
+    pub data: Vec<Vec<f64>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ColumnProfile {
     pub name: String,
     pub data_type: String,
@@ -36,14 +54,24 @@ pub struct ColumnProfile {
     pub avg_length: Option<String>,
     pub top_5_values: Vec<ValueFrequency>,
     pub pattern_sample: Vec<ValueFrequency>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub histogram: Option<Vec<HistogramBucket>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub top_values: Option<Vec<ValueFrequency>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub unique_ratio: Option<f64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProfileReport {
     pub row_count: usize,
     pub sample_percentage: u8,
     pub generated_at: String,
     pub columns: Vec<ColumnProfile>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub correlation_matrix: Option<CorrelationMatrix>,
 }
 
 /// Profile generation options for query pipeline profile output.
@@ -52,6 +80,8 @@ pub struct ProfileOptions {
     pub path: PathBuf,
     pub format: ProfileFormat,
     pub sample_percentage: u8,
+    pub detail: ProfileDetail,
+    pub top_k: usize,
 }
 
 /// Computes and renders profile reports from a [`DataFrame`].
@@ -80,19 +110,35 @@ impl Profiler {
             df
         };
 
-        let report = build_report(source, options.sample_percentage)?;
+        if options.detail == ProfileDetail::Synth && options.format != ProfileFormat::Json {
+            return Err(DtooError::Config {
+                message: "--detail synth requires JSON profile format".to_string(),
+            });
+        }
+
+        let report = build_report(
+            source,
+            options.sample_percentage,
+            options.detail,
+            options.top_k,
+        )?;
         write_report(options, &report)
     }
 }
 
 // ── Polars-based report builder ───────────────────────────────────────────────
 
-fn build_report(df: &DataFrame, sample_percentage: u8) -> Result<ProfileReport, DtooError> {
+fn build_report(
+    df: &DataFrame,
+    sample_percentage: u8,
+    detail: ProfileDetail,
+    top_k: usize,
+) -> Result<ProfileReport, DtooError> {
     let row_count = df.height();
     let mut columns = Vec::with_capacity(df.width());
 
     for col in df.columns() {
-        columns.push(profile_column(col, row_count)?);
+        columns.push(profile_column(col, row_count, detail, top_k)?);
     }
 
     Ok(ProfileReport {
@@ -100,10 +146,19 @@ fn build_report(df: &DataFrame, sample_percentage: u8) -> Result<ProfileReport, 
         sample_percentage,
         generated_at: Utc::now().to_rfc3339(),
         columns,
+        detail: (detail == ProfileDetail::Synth).then(|| "synth".to_string()),
+        correlation_matrix: None,
     })
 }
 
-fn profile_column(series: &Column, total_rows: usize) -> Result<ColumnProfile, DtooError> {
+fn profile_column(
+    series: &Column,
+    total_rows: usize,
+    detail: ProfileDetail,
+    top_k: usize,
+) -> Result<ColumnProfile, DtooError> {
+    // detail and top_k are used by Tasks 3–4; suppress unused-variable warnings for now.
+    let _ = (detail, top_k);
     let name = series.name().to_string();
     let dtype = series.dtype().clone();
     let data_type = format!("{dtype:?}");
@@ -142,6 +197,9 @@ fn profile_column(series: &Column, total_rows: usize) -> Result<ColumnProfile, D
         avg_length: None,
         top_5_values: top_5,
         pattern_sample: Vec::new(),
+        histogram: None,
+        top_values: None,
+        unique_ratio: None,
     };
 
     if is_numeric_dtype(&dtype) {
@@ -539,6 +597,8 @@ mod tests {
                 path: path.clone(),
                 format: ProfileFormat::Json,
                 sample_percentage: 100,
+                detail: ProfileDetail::Standard,
+                top_k: 1000,
             },
         )
         .expect("generate profile");
@@ -567,6 +627,8 @@ mod tests {
                 path: path.clone(),
                 format: ProfileFormat::Html,
                 sample_percentage: 100,
+                detail: ProfileDetail::Standard,
+                top_k: 1000,
             },
         )
         .expect("generate html profile");
@@ -602,7 +664,12 @@ mod tests {
                 avg_length: None,
                 top_5_values: Vec::new(),
                 pattern_sample: Vec::new(),
+                histogram: None,
+                top_values: None,
+                unique_ratio: None,
             }],
+            detail: None,
+            correlation_matrix: None,
         };
         let csv = render_csv(&report);
         assert!(csv.contains("\"a,b\""));
@@ -614,7 +681,7 @@ mod tests {
         // DuckDB COUNT(DISTINCT col) excludes NULLs; Polars n_unique() does not.
         // "a", "a", NULL → 1 distinct non-null value.
         let df = df!["c" => [Some("a"), Some("a"), None::<&str>]].unwrap();
-        let report = build_report(&df, 100).expect("build report");
+        let report = build_report(&df, 100, ProfileDetail::Standard, 1000).expect("build report");
         assert_eq!(
             report.columns[0].distinct_count, 1,
             "distinct_count must exclude NULLs (parity with DuckDB COUNT(DISTINCT))"
@@ -646,6 +713,8 @@ mod tests {
                 path: path.clone(),
                 format: ProfileFormat::Json,
                 sample_percentage: 100,
+                detail: ProfileDetail::Standard,
+                top_k: 1000,
             },
         )
         .unwrap();
@@ -672,6 +741,8 @@ mod tests {
                 path: path.clone(),
                 format: ProfileFormat::Json,
                 sample_percentage: 100,
+                detail: ProfileDetail::Standard,
+                top_k: 1000,
             },
         )
         .unwrap();
@@ -679,5 +750,28 @@ mod tests {
         assert!(contents.contains("\"min_length\""));
         assert!(contents.contains("\"pattern_sample\""));
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn standard_detail_json_has_no_synth_fields() {
+        let df = df!["id" => [1i64, 2, 3]].unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Standard, 1000).expect("report");
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        assert!(!json.contains("\"histogram\""));
+        assert!(!json.contains("\"top_values\""));
+        assert!(!json.contains("\"unique_ratio\""));
+        assert!(!json.contains("\"detail\""));
+        assert!(!json.contains("\"correlation_matrix\""));
+    }
+
+    #[test]
+    fn profile_report_round_trips_through_json() {
+        let df = df!["id" => [1i64, 2, 3]].unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Standard, 1000).expect("report");
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ProfileReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.row_count, 3);
+        assert_eq!(back.columns[0].name, "id");
+        assert!(back.columns[0].histogram.is_none());
     }
 }

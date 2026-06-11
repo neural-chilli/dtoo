@@ -47,6 +47,8 @@ pub fn run(args: &ProfileArgs) -> Result<(), DtooError> {
         path: args.output.clone().unwrap_or_else(|| PathBuf::from("-")),
         format: args.format,
         sample_percentage: args.sample,
+        detail: crate::cli::ProfileDetail::Standard,
+        top_k: 1000,
     };
     Profiler::generate(&df, &options)
 }

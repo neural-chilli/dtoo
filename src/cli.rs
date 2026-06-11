@@ -335,6 +335,16 @@ pub enum ProfileFormat {
     Html,
 }
 
+/// Controls how much detail is included in a profile report.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum ProfileDetail {
+    /// Standard output: per-column statistics only (default).
+    #[default]
+    Standard,
+    /// Synth output: adds histograms, top-K values, unique ratios, and correlation matrix.
+    Synth,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum CompressMethod {
     Gzip,
