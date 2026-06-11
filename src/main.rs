@@ -34,6 +34,7 @@ mod query_pipeline;
 mod reference_tables;
 #[allow(dead_code)]
 mod schema;
+mod synth;
 #[allow(dead_code)]
 mod types;
 
@@ -84,6 +85,7 @@ fn dispatch(cli: Cli) -> Result<(), DtooError> {
             Ok(())
         }
         Commands::Convert(args) => run_convert(&args),
+        Commands::Synth(args) => synth::run(&args),
     }
 }
 

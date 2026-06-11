@@ -25,6 +25,8 @@ polars = { version = "0.54.4", features = ["lazy", "sql", "csv", "parquet", "jso
 calamine = "0.35.0"
 flate2 = "1.1.9"
 zstd = "0.13.3"
+rand = "0.8"
+rand_chacha = "0.3"
 
 [profile.release]
 opt-level = 3

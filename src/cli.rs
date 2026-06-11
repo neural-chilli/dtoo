@@ -24,6 +24,7 @@ pub enum Commands {
     Profile(ProfileArgs),
     Inspect(InspectArgs),
     Fingerprint(FingerprintArgs),
+    Synth(SynthArgs),
 }
 
 /// Arguments for `dtoo query`.
@@ -268,6 +269,43 @@ pub struct InspectArgs {
 #[derive(Debug, Parser)]
 pub struct FingerprintArgs {
     pub path: PathBuf,
+}
+
+/// Arguments for `dtoo synth`.
+#[derive(Debug, Parser)]
+pub struct SynthArgs {
+    #[arg(long)]
+    pub spec: Option<PathBuf>,
+
+    #[arg(long)]
+    pub profile: Option<PathBuf>,
+
+    #[arg(long)]
+    pub rows: Option<usize>,
+
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    #[arg(long = "output-format", default_value = "csv")]
+    pub output_format: OutputFormat,
+
+    #[arg(long, default_value = ",")]
+    pub delimiter: char,
+
+    #[arg(long)]
+    pub compress: Option<CompressMethod>,
+
+    #[arg(long = "no-header")]
+    pub no_header: bool,
+
+    #[arg(long)]
+    pub seed: Option<u64>,
+
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
+
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
