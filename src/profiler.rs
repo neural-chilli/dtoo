@@ -160,8 +160,8 @@ fn profile_column(
     detail: ProfileDetail,
     top_k: usize,
 ) -> Result<ColumnProfile, DtooError> {
-    // detail and top_k are used by Tasks 3–4; suppress unused-variable warnings for now.
-    let _ = (detail, top_k);
+    // top_k is used by Task 4; suppress unused-variable warning for now.
+    let _ = top_k;
     let name = series.name().to_string();
     let dtype = series.dtype().clone();
     let data_type = format!("{dtype:?}");
@@ -237,6 +237,10 @@ fn profile_column(
         let as_str = series.cast(&DataType::String).map_err(polars_err)?;
         profile.min = scalar_to_opt_string(as_str.min_reduce().map_err(polars_err)?);
         profile.max = scalar_to_opt_string(as_str.max_reduce().map_err(polars_err)?);
+    }
+
+    if detail == ProfileDetail::Synth && (is_numeric_dtype(&dtype) || is_date_like_dtype(&dtype)) {
+        profile.histogram = numeric_histogram(series)?;
     }
 
     Ok(profile)
@@ -358,6 +362,71 @@ fn polars_err(e: PolarsError) -> DtooError {
     DtooError::Config {
         message: format!("profiler: {e}"),
     }
+}
+
+/// Extracts a column's non-null values as f64 of the physical representation
+/// (Date → days, Datetime → its unit, Time → ns, Decimal → scaled int as f64).
+fn physical_f64_values(series: &Column) -> Result<Vec<f64>, DtooError> {
+    let phys = series
+        .as_materialized_series()
+        .to_physical_repr()
+        .into_owned();
+    let as_f64 = phys.cast(&DataType::Float64).map_err(polars_err)?;
+    Ok(as_f64
+        .f64()
+        .map_err(polars_err)?
+        .iter()
+        .flatten()
+        // Safety: filter ensures only finite values remain; partial_cmp is safe below.
+        .filter(|v| v.is_finite())
+        .collect())
+}
+
+/// Builds a quantile-spaced histogram (up to 20 buckets) over non-null finite values.
+fn numeric_histogram(series: &Column) -> Result<Option<Vec<HistogramBucket>>, DtooError> {
+    let mut vals = physical_f64_values(series)?;
+    if vals.is_empty() {
+        return Ok(None);
+    }
+    // All values are finite (guaranteed by physical_f64_values), so partial_cmp always succeeds.
+    vals.sort_by(|a, b| a.partial_cmp(b).expect("finite values compare"));
+
+    let n_buckets = 20usize;
+    // Quantile-spaced edges; dedup keeps them strictly increasing under heavy ties.
+    let mut edges: Vec<f64> = (0..=n_buckets)
+        .map(|i| {
+            let p = i as f64 / n_buckets as f64;
+            let idx = ((vals.len() - 1) as f64 * p).round() as usize;
+            vals[idx]
+        })
+        .collect();
+    edges.dedup();
+    if edges.len() < 2 {
+        // All values identical: a single degenerate bucket.
+        return Ok(Some(vec![HistogramBucket {
+            lo: edges[0],
+            hi: edges[0],
+            count: vals.len() as u64,
+        }]));
+    }
+
+    let mut buckets: Vec<HistogramBucket> = edges
+        .windows(2)
+        .map(|w| HistogramBucket {
+            lo: w[0],
+            hi: w[1],
+            count: 0,
+        })
+        .collect();
+    // Count each value into the first bucket whose hi bounds it (last bucket is inclusive).
+    let mut b = 0usize;
+    for v in &vals {
+        while b + 1 < buckets.len() && *v > buckets[b].hi {
+            b += 1;
+        }
+        buckets[b].count += 1;
+    }
+    Ok(Some(buckets))
 }
 
 fn is_numeric_dtype(dt: &DataType) -> bool {
@@ -776,5 +845,70 @@ mod tests {
         assert_eq!(back.row_count, 3);
         assert_eq!(back.columns[0].name, "id");
         assert!(back.columns[0].histogram.is_none());
+    }
+
+    #[test]
+    fn synth_detail_adds_numeric_histogram() {
+        let vals: Vec<f64> = (0..1000).map(|i| i as f64).collect();
+        let df = df!["v" => vals].unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
+        let hist = report.columns[0].histogram.as_ref().expect("histogram");
+        assert_eq!(hist.len(), 20);
+        let total: u64 = hist.iter().map(|b| b.count).sum();
+        assert_eq!(total, 1000);
+        assert!(hist[0].lo <= 0.0 + f64::EPSILON);
+        assert!((hist[19].hi - 999.0).abs() < 1e-9);
+        for w in hist.windows(2) {
+            assert!(w[0].hi <= w[1].lo + 1e-9, "buckets must be ordered");
+        }
+    }
+
+    #[test]
+    fn synth_detail_histogram_handles_low_cardinality() {
+        let df = df!["v" => [1i64, 1, 2, 2, 3]].unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
+        let hist = report.columns[0].histogram.as_ref().expect("histogram");
+        assert!(hist.len() <= 3);
+        assert_eq!(hist.iter().map(|b| b.count).sum::<u64>(), 5);
+    }
+
+    #[test]
+    fn synth_detail_adds_date_histogram_with_physical_values() {
+        use chrono::NaiveDate;
+        let dates: Vec<NaiveDate> = (0..100)
+            .map(|i| NaiveDate::from_ymd_opt(2024, 1, 1).unwrap() + chrono::Duration::days(i))
+            .collect();
+        let s = Series::new("d".into(), dates);
+        let col = s.into_column();
+        let n = col.len();
+        let df = DataFrame::new(n, vec![col]).unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
+        let hist = report.columns[0]
+            .histogram
+            .as_ref()
+            .expect("date histogram");
+        // Date physical repr is days since epoch; 2024-01-01 = 19723.
+        assert!((hist[0].lo - 19723.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn standard_detail_has_no_histogram() {
+        let df = df!["v" => [1.0f64, 2.0, 3.0]].unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Standard, 1000).expect("report");
+        assert!(report.columns[0].histogram.is_none());
+    }
+
+    #[test]
+    fn populated_synth_report_round_trips_through_json() {
+        let df = df!["v" => (0..100).map(|i| i as f64).collect::<Vec<_>>()].unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
+        let json = serde_json::to_string(&report).unwrap();
+        let back: ProfileReport =
+            serde_json::from_str(&json).expect("deserialize populated report");
+        assert_eq!(
+            back.columns[0].histogram.as_ref().unwrap().len(),
+            report.columns[0].histogram.as_ref().unwrap().len()
+        );
+        assert_eq!(back.detail.as_deref(), Some(SYNTH_DETAIL));
     }
 }
