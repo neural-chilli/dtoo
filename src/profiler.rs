@@ -160,8 +160,6 @@ fn profile_column(
     detail: ProfileDetail,
     top_k: usize,
 ) -> Result<ColumnProfile, DtooError> {
-    // top_k is used by Task 4; suppress unused-variable warning for now.
-    let _ = top_k;
     let name = series.name().to_string();
     let dtype = series.dtype().clone();
     let data_type = format!("{dtype:?}");
@@ -179,7 +177,7 @@ fn profile_column(
         .n_unique()
         .map_err(polars_err)?;
 
-    let top_5 = top_values(series)?;
+    let top_5 = top_values(series, 5)?;
 
     let mut profile = ColumnProfile {
         name,
@@ -239,8 +237,16 @@ fn profile_column(
         profile.max = scalar_to_opt_string(as_str.max_reduce().map_err(polars_err)?);
     }
 
-    if detail == ProfileDetail::Synth && (is_numeric_dtype(&dtype) || is_date_like_dtype(&dtype)) {
-        profile.histogram = numeric_histogram(series)?;
+    if detail == ProfileDetail::Synth {
+        profile.top_values = Some(top_values(series, top_k)?);
+        profile.unique_ratio = Some(if count == 0 {
+            0.0
+        } else {
+            distinct_count as f64 / count as f64
+        });
+        if is_numeric_dtype(&dtype) || is_date_like_dtype(&dtype) {
+            profile.histogram = numeric_histogram(series)?;
+        }
     }
 
     Ok(profile)
@@ -258,8 +264,8 @@ fn string_char_lengths(series: &Column) -> Result<Vec<u32>, DtooError> {
     Ok(lengths)
 }
 
-/// Returns the top-5 most frequent non-null values, sorted descending by count.
-fn top_values(series: &Column) -> Result<Vec<ValueFrequency>, DtooError> {
+/// Returns the top-`limit` most frequent non-null values, sorted descending by count.
+fn top_values(series: &Column, limit: usize) -> Result<Vec<ValueFrequency>, DtooError> {
     // Cast to String so all types produce a uniform representation.
     let as_str = series.cast(&DataType::String).map_err(polars_err)?;
     let non_null = as_str.drop_nulls();
@@ -289,8 +295,8 @@ fn top_values(series: &Column) -> Result<Vec<ValueFrequency>, DtooError> {
         })
         .collect();
 
-    // value_counts with sort=true returns descending; take at most 5.
-    pairs.truncate(5);
+    // value_counts with sort=true returns descending; take at most `limit`.
+    pairs.truncate(limit);
     Ok(pairs)
 }
 
@@ -1187,5 +1193,27 @@ mod tests {
             report.columns[0].histogram.as_ref().unwrap().len()
         );
         assert_eq!(back.detail.as_deref(), Some(SYNTH_DETAIL));
+    }
+
+    #[test]
+    fn synth_detail_adds_top_k_and_unique_ratio() {
+        let vals: Vec<String> = (0..50).map(|i| format!("v{}", i % 10)).collect();
+        let df = df!["c" => vals].unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 7).expect("report");
+        let col = &report.columns[0];
+        let top = col.top_values.as_ref().expect("top_values");
+        assert_eq!(top.len(), 7, "truncated to top_k");
+        assert_eq!(top[0].freq, 5);
+        assert!((col.unique_ratio.unwrap() - 10.0 / 50.0).abs() < 1e-9);
+        // top_5_values retained for backward compatibility
+        assert_eq!(col.top_5_values.len(), 5);
+    }
+
+    #[test]
+    fn unique_ratio_is_zero_for_empty_frame() {
+        let col = Series::new_empty("c".into(), &DataType::String).into_column();
+        let df = DataFrame::new(0, vec![col]).unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
+        assert_eq!(report.columns[0].unique_ratio, Some(0.0));
     }
 }
