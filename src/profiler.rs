@@ -395,17 +395,29 @@ fn physical_f64_values(series: &Column) -> Result<Vec<f64>, DtooError> {
 
 /// Builds a quantile-spaced histogram (up to 20 buckets) over non-null finite values.
 ///
-/// Under extreme skew (e.g. 99% zeros + outliers) multiple quantile positions
-/// collapse to the same edge value. Instead of letting `dedup` merge them into
-/// one wide continuous bucket (which would flatten the distribution for downstream
-/// synth sampling), we emit an explicit *point-mass* bucket `{lo: v, hi: v}` for
-/// each value that absorbed more than one quantile position, followed by a
-/// continuous bucket from that value to the next distinct edge.
+/// **Point-mass handling.** When multiple of the 21 raw quantile positions collapse
+/// onto the same edge value `v` (extreme skew), `v` is a *point mass*. We emit a
+/// dedicated point-mass bucket `{lo: v, hi: v}` for it; if a next distinct edge
+/// exists, a continuous bucket `{lo: v, hi: next}` follows. This ensures tied
+/// values route to their own bucket and are not smeared into a neighbouring wide
+/// continuous bucket.
 ///
-/// Invariants preserved by this function:
+/// **Two-pass counting.**
+/// Pass 1: run-length encode sorted `vals` → `(value, run_count)` pairs.
+/// Pass 2: route each pair with a forward pointer over the (sorted) bucket list:
+///   - If the current bucket is a point mass (`lo == hi`) and `value == lo` → add
+///     `run_count` there.
+///   - Otherwise advance past buckets whose `hi < value` (strict; point-mass
+///     buckets where `lo == value` were already checked) and add `run_count` to
+///     the first bucket with `hi >= value`. The last bucket absorbs any remainder.
+///
+/// Zero-count buckets are pruned after counting.
+///
+/// **Invariants preserved:**
 /// - `counts.sum() == total finite values`
-/// - buckets are ordered: each bucket's `hi <= next bucket's lo`
+/// - buckets are ordered: `w[i].hi <= w[i+1].lo` for every consecutive pair
 /// - `buckets[0].lo == min`, `buckets.last().hi == max`
+/// - every bucket: `lo <= hi`
 fn numeric_histogram(series: &Column) -> Result<Option<Vec<HistogramBucket>>, DtooError> {
     let mut vals = physical_f64_values(series)?;
     if vals.is_empty() {
@@ -415,7 +427,7 @@ fn numeric_histogram(series: &Column) -> Result<Option<Vec<HistogramBucket>>, Dt
     vals.sort_unstable_by(|a, b| a.partial_cmp(b).expect("finite values compare"));
 
     let n_buckets = 20usize;
-    // Collect raw quantile edge positions (21 values for 20 buckets).
+    // Collect 21 raw quantile edge positions (boundaries for 20 buckets).
     let raw_edges: Vec<f64> = (0..=n_buckets)
         .map(|i| {
             let p = i as f64 / n_buckets as f64;
@@ -425,12 +437,12 @@ fn numeric_histogram(series: &Column) -> Result<Option<Vec<HistogramBucket>>, Dt
         .collect();
 
     // Count how many of the 21 raw positions collapsed onto each distinct edge value.
-    // If only one position maps to a value it becomes a normal continuous-bucket boundary;
-    // if more than one position maps to the same value it is a point mass.
+    // Edges come from the same sorted array, so exact equality is correct here —
+    // using an absolute epsilon risks merging genuinely distinct tiny values.
     let mut edge_counts: Vec<(f64, usize)> = Vec::new();
     for v in &raw_edges {
         if let Some(last) = edge_counts.last_mut()
-            && (last.0 - v).abs() < f64::EPSILON
+            && last.0 == *v
         {
             last.1 += 1;
             continue;
@@ -439,7 +451,7 @@ fn numeric_histogram(series: &Column) -> Result<Option<Vec<HistogramBucket>>, Dt
     }
 
     if edge_counts.len() < 2 {
-        // All values identical: a single degenerate bucket.
+        // All values identical: a single degenerate point-mass bucket.
         return Ok(Some(vec![HistogramBucket {
             lo: edge_counts[0].0,
             hi: edge_counts[0].0,
@@ -447,58 +459,92 @@ fn numeric_histogram(series: &Column) -> Result<Option<Vec<HistogramBucket>>, Dt
         }]));
     }
 
-    // Build the bucket list.  For each deduped edge value that absorbed >1 raw
-    // quantile position, prepend a point-mass bucket (lo == hi == v) before the
-    // continuous bucket that runs from v to the next distinct edge.
+    // Build the ordered bucket list.
+    //
+    // For each deduped edge `e[i]` in order:
+    //   • if `e[i]` is a point mass (collapsed >1 raw positions) → push a
+    //     point-mass bucket `{lo: e[i], hi: e[i]}`.
+    //   • if a next distinct edge `e[i+1]` exists → push a continuous bucket
+    //     `{lo: e[i], hi: e[i+1]}`.
+    //
+    // A point-mass bucket always precedes the continuous bucket that starts at
+    // the same value, so tied values route to the point-mass bucket first.
     let deduped_edges: Vec<f64> = edge_counts.iter().map(|(v, _)| *v).collect();
     let mut buckets: Vec<HistogramBucket> = Vec::new();
-    for (win_idx, w) in deduped_edges.windows(2).enumerate() {
-        let (lo, hi) = (w[0], w[1]);
-        let count_for_lo = edge_counts[win_idx].1;
-        if count_for_lo > 1 {
-            // This edge value was a quantile pile-up → point-mass bucket first.
+    for i in 0..deduped_edges.len() {
+        let lo = deduped_edges[i];
+        let is_point_mass = edge_counts[i].1 > 1;
+        if is_point_mass {
             buckets.push(HistogramBucket {
                 lo,
                 hi: lo,
                 count: 0,
             });
         }
-        buckets.push(HistogramBucket { lo, hi, count: 0 });
-    }
-    // Handle the last edge: if it also absorbed >1 positions it needs a point-mass bucket.
-    let last_idx = edge_counts.len() - 1;
-    if edge_counts[last_idx].1 > 1 {
-        let last_v = deduped_edges[last_idx];
-        buckets.push(HistogramBucket {
-            lo: last_v,
-            hi: last_v,
-            count: 0,
-        });
+        if i + 1 < deduped_edges.len() {
+            let hi = deduped_edges[i + 1];
+            buckets.push(HistogramBucket { lo, hi, count: 0 });
+        }
     }
 
-    // Single-pass O(n) count into buckets over the sorted values.
-    // Point-mass buckets absorb values where v == bucket.lo == bucket.hi.
-    // Continuous buckets absorb values where bucket.lo <= v <= bucket.hi (last is inclusive).
+    // Pass 1: run-length encode sorted vals into (value, run_count) pairs.
+    let mut rle: Vec<(f64, u64)> = Vec::new();
+    for &v in &vals {
+        if let Some(last) = rle.last_mut()
+            && last.0 == v
+        {
+            last.1 += 1;
+        } else {
+            rle.push((v, 1));
+        }
+    }
+
+    // Pass 2: route each (value, run_count) pair to the correct bucket using a
+    // forward pointer. Both `rle` and `buckets` are sorted, so this is O(n + k).
+    //
+    // Routing rule:
+    //   • If current bucket is a point mass (`lo == hi`) and `lo == value` → route here.
+    //   • Otherwise advance while the current bucket cannot contain the value:
+    //     - A continuous bucket (`lo < hi`) cannot contain `value` when:
+    //         `hi < value` (value is beyond this bucket), OR
+    //         `hi == value` AND the next bucket is a point mass for the same value
+    //         (the point-mass bucket takes precedence for exact ties at the boundary).
+    //     - A point-mass bucket (`lo == hi`) cannot contain `value` when `lo < value`.
+    //   • After advancing, add run_count to the current bucket (or the last bucket as
+    //     a catch-all if no bucket strictly satisfies the condition).
     let mut b = 0usize;
-    for v in &vals {
-        // Advance past buckets that cannot contain v.
+    for (value, run_count) in &rle {
+        // Advance forward while the current bucket cannot hold this value.
         while b + 1 < buckets.len() {
             let bk = &buckets[b];
-            if bk.lo == bk.hi {
-                // Point-mass bucket: only exact matches belong here; anything
-                // larger should move to the next bucket.
-                if *v > bk.hi {
+            let is_pm = bk.lo == bk.hi;
+            if is_pm {
+                // Point-mass bucket: only exact match belongs here.
+                if bk.lo < *value {
                     b += 1;
                     continue;
                 }
-            } else if *v > bk.hi {
-                b += 1;
-                continue;
+            } else {
+                // Continuous bucket: advance when hi < value, OR when hi == value
+                // and the immediately following bucket is a point-mass for that value.
+                let next_is_pm_for_value = {
+                    let nb = &buckets[b + 1];
+                    nb.lo == nb.hi && nb.lo == *value
+                };
+                if bk.hi < *value || (bk.hi == *value && next_is_pm_for_value) {
+                    b += 1;
+                    continue;
+                }
             }
             break;
         }
-        buckets[b].count += 1;
+        buckets[b].count += run_count;
     }
+
+    // Prune zero-count buckets (they are dead weight for weighted sampling).
+    // The invariants survive pruning because min and max always land in some bucket.
+    buckets.retain(|b| b.count > 0);
+
     Ok(Some(buckets))
 }
 
@@ -938,10 +984,8 @@ mod tests {
 
     #[test]
     fn synth_detail_histogram_handles_low_cardinality() {
-        // [1, 1, 2, 2, 3]: with point-mass logic the repeated values (1 and 2)
-        // each get a point-mass bucket plus a continuous bucket where needed, so
-        // the result may have up to 5 buckets (loosened from the original <= 3,
-        // which assumed plain dedup without point-mass preservation).
+        // [1, 1, 2, 2, 3]: 1 and 2 are point masses; the lone 3 lands in a
+        // continuous bucket.  After pruning, zero-count buckets are removed.
         let df = df!["v" => [1i64, 1, 2, 2, 3]].unwrap();
         let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
         let hist = report.columns[0].histogram.as_ref().expect("histogram");
@@ -949,6 +993,68 @@ mod tests {
             hist.len() <= 5,
             "expected <= 5 buckets with point-mass logic, got {}",
             hist.len()
+        );
+        assert_eq!(hist.iter().map(|b| b.count).sum::<u64>(), 5);
+        // Point-mass bucket for 1 must carry exactly 2.
+        let pm1 = hist
+            .iter()
+            .find(|b| b.lo == 1.0 && b.hi == 1.0)
+            .expect("point-mass bucket for 1.0");
+        assert_eq!(pm1.count, 2, "point-mass at 1.0 should have count 2");
+        // Point-mass bucket for 2 must carry exactly 2.
+        let pm2 = hist
+            .iter()
+            .find(|b| b.lo == 2.0 && b.hi == 2.0)
+            .expect("point-mass bucket for 2.0");
+        assert_eq!(pm2.count, 2, "point-mass at 2.0 should have count 2");
+    }
+
+    #[test]
+    fn point_mass_at_maximum_gets_its_own_bucket() {
+        let mut vals: Vec<f64> = (1..=10).map(|i| i as f64).collect();
+        vals.extend(std::iter::repeat_n(100.0, 990));
+        let df = df!["v" => vals].unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
+        let hist = report.columns[0].histogram.as_ref().expect("histogram");
+        assert_eq!(hist.iter().map(|b| b.count).sum::<u64>(), 1000);
+        let pm = hist
+            .iter()
+            .find(|b| b.lo == 100.0 && b.hi == 100.0)
+            .expect("point mass at max");
+        assert_eq!(pm.count, 990, "all ties belong to the point-mass bucket");
+        for w in hist.windows(2) {
+            assert!(w[0].hi <= w[1].lo + 1e-9);
+        }
+    }
+
+    #[test]
+    fn point_mass_in_interior_gets_its_own_bucket() {
+        let mut vals: Vec<f64> = (0..100).map(|i| i as f64).collect();
+        vals.extend(std::iter::repeat_n(50.0, 800));
+        vals.extend((100..200).map(|i| i as f64));
+        let df = df!["v" => vals].unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
+        let hist = report.columns[0].histogram.as_ref().expect("histogram");
+        assert_eq!(hist.iter().map(|b| b.count).sum::<u64>(), 1000);
+        let pm = hist
+            .iter()
+            .find(|b| b.lo == 50.0 && b.hi == 50.0)
+            .expect("interior point mass");
+        assert!(
+            pm.count >= 800,
+            "ties route to the point bucket, got {}",
+            pm.count
+        );
+    }
+
+    #[test]
+    fn no_zero_count_buckets_survive() {
+        let df = df!["v" => [1.0f64, 1.0, 2.0, 2.0, 3.0]].unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
+        let hist = report.columns[0].histogram.as_ref().expect("histogram");
+        assert!(
+            hist.iter().all(|b| b.count > 0),
+            "zero-count buckets must be pruned: {hist:?}"
         );
         assert_eq!(hist.iter().map(|b| b.count).sum::<u64>(), 5);
     }
