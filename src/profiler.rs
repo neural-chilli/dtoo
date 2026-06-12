@@ -364,65 +364,138 @@ fn polars_err(e: PolarsError) -> DtooError {
     }
 }
 
-/// Extracts a column's non-null values as f64 of the physical representation
-/// (Date → days, Datetime → its unit, Time → ns, Decimal → scaled int as f64).
+/// Extracts a column's non-null values as f64 in logical (value) space.
+///
+/// For most types this goes through the physical representation (Date → days since
+/// epoch, Datetime → its time-unit integer, Time → nanoseconds). Decimal is
+/// special: `to_physical_repr()` yields the scaled integer (value × 10^scale), but
+/// histograms must live in value space to match the min/max strings and to be
+/// useful for downstream synth generation. We cast Decimal directly to Float64,
+/// which Polars implements as value-space conversion.
 fn physical_f64_values(series: &Column) -> Result<Vec<f64>, DtooError> {
-    let phys = series
-        .as_materialized_series()
-        .to_physical_repr()
-        .into_owned();
-    let as_f64 = phys.cast(&DataType::Float64).map_err(polars_err)?;
+    let s = series.as_materialized_series();
+    let as_f64 = if matches!(s.dtype(), DataType::Decimal(_, _)) {
+        // Decimal's physical repr is the scaled integer (value × 10^scale); cast the
+        // logical value directly so histograms live in value space like min/max.
+        s.cast(&DataType::Float64).map_err(polars_err)?
+    } else {
+        s.to_physical_repr()
+            .into_owned()
+            .cast(&DataType::Float64)
+            .map_err(polars_err)?
+    };
     Ok(as_f64
         .f64()
         .map_err(polars_err)?
         .iter()
         .flatten()
-        // Safety: filter ensures only finite values remain; partial_cmp is safe below.
         .filter(|v| v.is_finite())
         .collect())
 }
 
 /// Builds a quantile-spaced histogram (up to 20 buckets) over non-null finite values.
+///
+/// Under extreme skew (e.g. 99% zeros + outliers) multiple quantile positions
+/// collapse to the same edge value. Instead of letting `dedup` merge them into
+/// one wide continuous bucket (which would flatten the distribution for downstream
+/// synth sampling), we emit an explicit *point-mass* bucket `{lo: v, hi: v}` for
+/// each value that absorbed more than one quantile position, followed by a
+/// continuous bucket from that value to the next distinct edge.
+///
+/// Invariants preserved by this function:
+/// - `counts.sum() == total finite values`
+/// - buckets are ordered: each bucket's `hi <= next bucket's lo`
+/// - `buckets[0].lo == min`, `buckets.last().hi == max`
 fn numeric_histogram(series: &Column) -> Result<Option<Vec<HistogramBucket>>, DtooError> {
     let mut vals = physical_f64_values(series)?;
     if vals.is_empty() {
         return Ok(None);
     }
     // All values are finite (guaranteed by physical_f64_values), so partial_cmp always succeeds.
-    vals.sort_by(|a, b| a.partial_cmp(b).expect("finite values compare"));
+    vals.sort_unstable_by(|a, b| a.partial_cmp(b).expect("finite values compare"));
 
     let n_buckets = 20usize;
-    // Quantile-spaced edges; dedup keeps them strictly increasing under heavy ties.
-    let mut edges: Vec<f64> = (0..=n_buckets)
+    // Collect raw quantile edge positions (21 values for 20 buckets).
+    let raw_edges: Vec<f64> = (0..=n_buckets)
         .map(|i| {
             let p = i as f64 / n_buckets as f64;
             let idx = ((vals.len() - 1) as f64 * p).round() as usize;
             vals[idx]
         })
         .collect();
-    edges.dedup();
-    if edges.len() < 2 {
+
+    // Count how many of the 21 raw positions collapsed onto each distinct edge value.
+    // If only one position maps to a value it becomes a normal continuous-bucket boundary;
+    // if more than one position maps to the same value it is a point mass.
+    let mut edge_counts: Vec<(f64, usize)> = Vec::new();
+    for v in &raw_edges {
+        if let Some(last) = edge_counts.last_mut()
+            && (last.0 - v).abs() < f64::EPSILON
+        {
+            last.1 += 1;
+            continue;
+        }
+        edge_counts.push((*v, 1));
+    }
+
+    if edge_counts.len() < 2 {
         // All values identical: a single degenerate bucket.
         return Ok(Some(vec![HistogramBucket {
-            lo: edges[0],
-            hi: edges[0],
+            lo: edge_counts[0].0,
+            hi: edge_counts[0].0,
             count: vals.len() as u64,
         }]));
     }
 
-    let mut buckets: Vec<HistogramBucket> = edges
-        .windows(2)
-        .map(|w| HistogramBucket {
-            lo: w[0],
-            hi: w[1],
+    // Build the bucket list.  For each deduped edge value that absorbed >1 raw
+    // quantile position, prepend a point-mass bucket (lo == hi == v) before the
+    // continuous bucket that runs from v to the next distinct edge.
+    let deduped_edges: Vec<f64> = edge_counts.iter().map(|(v, _)| *v).collect();
+    let mut buckets: Vec<HistogramBucket> = Vec::new();
+    for (win_idx, w) in deduped_edges.windows(2).enumerate() {
+        let (lo, hi) = (w[0], w[1]);
+        let count_for_lo = edge_counts[win_idx].1;
+        if count_for_lo > 1 {
+            // This edge value was a quantile pile-up → point-mass bucket first.
+            buckets.push(HistogramBucket {
+                lo,
+                hi: lo,
+                count: 0,
+            });
+        }
+        buckets.push(HistogramBucket { lo, hi, count: 0 });
+    }
+    // Handle the last edge: if it also absorbed >1 positions it needs a point-mass bucket.
+    let last_idx = edge_counts.len() - 1;
+    if edge_counts[last_idx].1 > 1 {
+        let last_v = deduped_edges[last_idx];
+        buckets.push(HistogramBucket {
+            lo: last_v,
+            hi: last_v,
             count: 0,
-        })
-        .collect();
-    // Count each value into the first bucket whose hi bounds it (last bucket is inclusive).
+        });
+    }
+
+    // Single-pass O(n) count into buckets over the sorted values.
+    // Point-mass buckets absorb values where v == bucket.lo == bucket.hi.
+    // Continuous buckets absorb values where bucket.lo <= v <= bucket.hi (last is inclusive).
     let mut b = 0usize;
     for v in &vals {
-        while b + 1 < buckets.len() && *v > buckets[b].hi {
-            b += 1;
+        // Advance past buckets that cannot contain v.
+        while b + 1 < buckets.len() {
+            let bk = &buckets[b];
+            if bk.lo == bk.hi {
+                // Point-mass bucket: only exact matches belong here; anything
+                // larger should move to the next bucket.
+                if *v > bk.hi {
+                    b += 1;
+                    continue;
+                }
+            } else if *v > bk.hi {
+                b += 1;
+                continue;
+            }
+            break;
         }
         buckets[b].count += 1;
     }
@@ -865,10 +938,18 @@ mod tests {
 
     #[test]
     fn synth_detail_histogram_handles_low_cardinality() {
+        // [1, 1, 2, 2, 3]: with point-mass logic the repeated values (1 and 2)
+        // each get a point-mass bucket plus a continuous bucket where needed, so
+        // the result may have up to 5 buckets (loosened from the original <= 3,
+        // which assumed plain dedup without point-mass preservation).
         let df = df!["v" => [1i64, 1, 2, 2, 3]].unwrap();
         let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
         let hist = report.columns[0].histogram.as_ref().expect("histogram");
-        assert!(hist.len() <= 3);
+        assert!(
+            hist.len() <= 5,
+            "expected <= 5 buckets with point-mass logic, got {}",
+            hist.len()
+        );
         assert_eq!(hist.iter().map(|b| b.count).sum::<u64>(), 5);
     }
 
@@ -896,6 +977,96 @@ mod tests {
         let df = df!["v" => [1.0f64, 2.0, 3.0]].unwrap();
         let report = build_report(&df, 100, ProfileDetail::Standard, 1000).expect("report");
         assert!(report.columns[0].histogram.is_none());
+    }
+
+    // ── Fix 1: Decimal histograms must live in value space ───────────────────
+
+    #[test]
+    fn decimal_histogram_buckets_are_in_value_space() {
+        // Build a column of Decimal values representing 11111.0 and 22222.0.
+        // Cast Float64 → Decimal(10, 2) so physical repr would be 1111100 / 2222200
+        // (value × 10^2), but the histogram lo/hi should still be ≈ 11111.0 / 22222.0.
+        let s = Series::new("d".into(), &[11111.0f64, 22222.0f64])
+            .cast(&DataType::Decimal(10, 2))
+            .expect("cast to decimal");
+        let col = s.into_column();
+        let n = col.len();
+        let df = DataFrame::new(n, vec![col]).unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
+        let hist = report.columns[0].histogram.as_ref().expect("histogram");
+        // The first bucket's lo should be close to 11111.0, NOT 1111100.0.
+        assert!(
+            (hist[0].lo - 11111.0).abs() < 1.0,
+            "expected lo ≈ 11111.0 (value space), got {}",
+            hist[0].lo
+        );
+    }
+
+    // ── Fix 2: Point-mass buckets under extreme skew ─────────────────────────
+
+    #[test]
+    fn skewed_column_has_point_mass_bucket_for_zeros() {
+        // 990 zeros + 10 values spread across 1..=100.
+        let mut data: Vec<i64> = vec![0i64; 990];
+        data.extend((1i64..=10).map(|i| i * 10));
+        let s = Series::new("v".into(), data);
+        let col = s.into_column();
+        let n = col.len();
+        let df = DataFrame::new(n, vec![col]).unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
+        let hist = report.columns[0].histogram.as_ref().expect("histogram");
+
+        // (a) counts sum to total rows
+        let total: u64 = hist.iter().map(|b| b.count).sum();
+        assert_eq!(total, 1000, "counts must sum to 1000");
+
+        // (b) there is a point-mass bucket at 0.0 carrying >= 950 values
+        let zero_bucket = hist.iter().find(|b| b.lo == 0.0 && b.hi == 0.0);
+        assert!(
+            zero_bucket.is_some(),
+            "expected a point-mass bucket at 0.0; buckets: {hist:?}"
+        );
+        assert!(
+            zero_bucket.unwrap().count >= 950,
+            "point-mass bucket at 0.0 should carry >= 950, got {}",
+            zero_bucket.unwrap().count
+        );
+
+        // (c) buckets are ordered
+        for w in hist.windows(2) {
+            assert!(
+                w[0].hi <= w[1].lo + 1e-9,
+                "buckets out of order: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    // ── Fix 3: Degenerate branches ────────────────────────────────────────────
+
+    #[test]
+    fn all_identical_column_produces_single_point_mass_bucket() {
+        let df = df!["v" => [5i64, 5, 5]].unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
+        let hist = report.columns[0].histogram.as_ref().expect("histogram");
+        assert_eq!(hist.len(), 1, "single bucket expected; got {hist:?}");
+        assert_eq!(hist[0].lo, 5.0);
+        assert_eq!(hist[0].hi, 5.0);
+        assert_eq!(hist[0].count, 3);
+    }
+
+    #[test]
+    fn all_null_column_produces_no_histogram() {
+        let s = Series::new("v".into(), &[None::<f64>, None::<f64>, None::<f64>]);
+        let col = s.into_column();
+        let n = col.len();
+        let df = DataFrame::new(n, vec![col]).unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
+        assert!(
+            report.columns[0].histogram.is_none(),
+            "all-null column should yield no histogram"
+        );
     }
 
     #[test]
