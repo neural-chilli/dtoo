@@ -177,7 +177,15 @@ fn profile_column(
         .n_unique()
         .map_err(polars_err)?;
 
-    let top_5 = top_values(series, 5)?;
+    // Compute the frequency list once; at synth detail we may need up to top_k entries,
+    // so fetch max(top_k, 5) in that case and slice the first 5 for top_5_values.
+    let top_limit = if detail == ProfileDetail::Synth {
+        top_k.max(5)
+    } else {
+        5
+    };
+    let all_top = top_values(series, top_limit)?;
+    let top_5: Vec<ValueFrequency> = all_top.iter().take(5).cloned().collect();
 
     let mut profile = ColumnProfile {
         name,
@@ -238,7 +246,9 @@ fn profile_column(
     }
 
     if detail == ProfileDetail::Synth {
-        profile.top_values = Some(top_values(series, top_k)?);
+        profile.top_values = Some(all_top);
+        // Denominator is total rows (incl. nulls), per spec 35; matches the
+        // load_profile fallback and Task 12 fan-out math for nullable FK columns.
         profile.unique_ratio = Some(if count == 0 {
             0.0
         } else {
