@@ -574,6 +574,10 @@ fn numeric_histogram(series: &Column) -> Result<Option<Vec<HistogramBucket>>, Dt
 
 /// Average ranks (1-based) with ties sharing their mean rank.
 fn rank_values(values: &[f64]) -> Vec<f64> {
+    debug_assert!(
+        values.iter().all(|v| v.is_finite()),
+        "rank_values requires finite inputs; filter NaN/Inf before calling"
+    );
     let mut idx: Vec<usize> = (0..values.len()).collect();
     idx.sort_by(|&a, &b| {
         values[a]
@@ -598,6 +602,7 @@ fn rank_values(values: &[f64]) -> Vec<f64> {
 
 /// Pearson correlation; 0.0 when either side has zero variance.
 fn pearson(xs: &[f64], ys: &[f64]) -> f64 {
+    debug_assert_eq!(xs.len(), ys.len(), "pearson: inputs must have equal length");
     let n = xs.len() as f64;
     let mx = xs.iter().sum::<f64>() / n;
     let my = ys.iter().sum::<f64>() / n;
@@ -673,6 +678,9 @@ fn spearman_matrix(df: &DataFrame) -> Result<Option<CorrelationMatrix>, DtooErro
     let mut data = vec![vec![0.0; k]; k];
     for i in 0..k {
         data[i][i] = 1.0;
+        // Each cell uses only the rows where both columns are non-null and finite
+        // (pairwise-complete deletion), so different pairs may use different row subsets;
+        // this is why Task 11 applies PSD repair before Cholesky.
         for j in (i + 1)..k {
             let r = spearman_pair(&cols[i], &cols[j]);
             data[i][j] = r;
