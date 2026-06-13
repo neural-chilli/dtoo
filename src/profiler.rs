@@ -144,13 +144,19 @@ fn build_report(
         columns.push(profile_column(col, row_count, detail, top_k)?);
     }
 
+    let correlation_matrix = if detail == ProfileDetail::Synth {
+        spearman_matrix(df)?
+    } else {
+        None
+    };
+
     Ok(ProfileReport {
         row_count,
         sample_percentage,
         generated_at: Utc::now().to_rfc3339(),
         columns,
         detail: (detail == ProfileDetail::Synth).then(|| SYNTH_DETAIL.to_string()),
-        correlation_matrix: None,
+        correlation_matrix,
     })
 }
 
@@ -562,6 +568,121 @@ fn numeric_histogram(series: &Column) -> Result<Option<Vec<HistogramBucket>>, Dt
     buckets.retain(|b| b.count > 0);
 
     Ok(Some(buckets))
+}
+
+// ── Spearman correlation matrix ───────────────────────────────────────────────
+
+/// Average ranks (1-based) with ties sharing their mean rank.
+fn rank_values(values: &[f64]) -> Vec<f64> {
+    let mut idx: Vec<usize> = (0..values.len()).collect();
+    idx.sort_by(|&a, &b| {
+        values[a]
+            .partial_cmp(&values[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut ranks = vec![0.0; values.len()];
+    let mut i = 0;
+    while i < idx.len() {
+        let mut j = i;
+        while j + 1 < idx.len() && values[idx[j + 1]] == values[idx[i]] {
+            j += 1;
+        }
+        let avg = (i + j + 2) as f64 / 2.0; // mean of 1-based ranks i+1..=j+1
+        for k in i..=j {
+            ranks[idx[k]] = avg;
+        }
+        i = j + 1;
+    }
+    ranks
+}
+
+/// Pearson correlation; 0.0 when either side has zero variance.
+fn pearson(xs: &[f64], ys: &[f64]) -> f64 {
+    let n = xs.len() as f64;
+    let mx = xs.iter().sum::<f64>() / n;
+    let my = ys.iter().sum::<f64>() / n;
+    let mut cov = 0.0;
+    let mut vx = 0.0;
+    let mut vy = 0.0;
+    for (x, y) in xs.iter().zip(ys) {
+        cov += (x - mx) * (y - my);
+        vx += (x - mx) * (x - mx);
+        vy += (y - my) * (y - my);
+    }
+    if vx <= 0.0 || vy <= 0.0 {
+        0.0
+    } else {
+        cov / (vx.sqrt() * vy.sqrt())
+    }
+}
+
+/// Spearman over rows where BOTH columns are present AND finite; 0.0 for <2 pairs.
+fn spearman_pair(xs: &[Option<f64>], ys: &[Option<f64>]) -> f64 {
+    let pairs: Vec<(f64, f64)> = xs
+        .iter()
+        .zip(ys)
+        .filter_map(|(x, y)| {
+            let (x, y) = ((*x)?, (*y)?);
+            (x.is_finite() && y.is_finite()).then_some((x, y))
+        })
+        .collect();
+    if pairs.len() < 2 {
+        return 0.0;
+    }
+    let rx = rank_values(&pairs.iter().map(|p| p.0).collect::<Vec<_>>());
+    let ry = rank_values(&pairs.iter().map(|p| p.1).collect::<Vec<_>>());
+    pearson(&rx, &ry)
+}
+
+fn corr_eligible(dt: &DataType) -> bool {
+    is_numeric_dtype(dt) || matches!(dt, DataType::Date | DataType::Datetime(_, _))
+}
+
+/// Extracts a column's values as `Option<f64>`, preserving null positions.
+///
+/// Uses `to_physical_repr()` which for most types yields the physical integer
+/// (Date → days since epoch, Datetime → time-unit integer). For Decimal this
+/// yields the scaled integer (value × 10^scale), but that is fine for Spearman:
+/// the correlation is rank-based and a monotonic scaling preserves all ranks, so
+/// scaled vs. value space gives identical correlation coefficients. We therefore
+/// do NOT special-case Decimal here (unlike `physical_f64_values` for histograms,
+/// which must live in value space to match min/max strings).
+fn physical_f64_with_nulls(series: &Column) -> Result<Vec<Option<f64>>, DtooError> {
+    let phys = series
+        .as_materialized_series()
+        .to_physical_repr()
+        .into_owned();
+    let as_f64 = phys.cast(&DataType::Float64).map_err(polars_err)?;
+    Ok(as_f64.f64().map_err(polars_err)?.iter().collect())
+}
+
+/// Spearman correlation matrix over all eligible columns; `None` when < 2 eligible.
+fn spearman_matrix(df: &DataFrame) -> Result<Option<CorrelationMatrix>, DtooError> {
+    let mut names = Vec::new();
+    let mut cols: Vec<Vec<Option<f64>>> = Vec::new();
+    for col in df.columns() {
+        if corr_eligible(col.dtype()) {
+            names.push(col.name().to_string());
+            cols.push(physical_f64_with_nulls(col)?);
+        }
+    }
+    if names.len() < 2 {
+        return Ok(None);
+    }
+    let k = names.len();
+    let mut data = vec![vec![0.0; k]; k];
+    for i in 0..k {
+        data[i][i] = 1.0;
+        for j in (i + 1)..k {
+            let r = spearman_pair(&cols[i], &cols[j]);
+            data[i][j] = r;
+            data[j][i] = r;
+        }
+    }
+    Ok(Some(CorrelationMatrix {
+        columns: names,
+        data,
+    }))
 }
 
 fn is_numeric_dtype(dt: &DataType) -> bool {
@@ -1225,5 +1346,54 @@ mod tests {
         let df = DataFrame::new(0, vec![col]).unwrap();
         let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
         assert_eq!(report.columns[0].unique_ratio, Some(0.0));
+    }
+
+    #[test]
+    fn ranks_average_ties() {
+        assert_eq!(
+            rank_values(&[10.0, 20.0, 20.0, 30.0]),
+            vec![1.0, 2.5, 2.5, 4.0]
+        );
+    }
+
+    #[test]
+    fn synth_detail_adds_correlation_matrix() {
+        let x: Vec<f64> = (0..100).map(|i| i as f64).collect();
+        let y: Vec<f64> = (0..100).map(|i| (i * 2) as f64).collect(); // perfectly monotone with x
+        let z: Vec<f64> = (0..100).map(|i| ((i * 7919) % 100) as f64).collect(); // scrambled
+        let df = df!["x" => x, "y" => y, "z" => z, "s" => vec!["a"; 100]].unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
+        let m = report.correlation_matrix.as_ref().expect("matrix");
+        assert_eq!(m.columns, vec!["x", "y", "z"]); // string column excluded
+        assert!((m.data[0][0] - 1.0).abs() < 1e-9);
+        assert!((m.data[0][1] - 1.0).abs() < 1e-6, "x~y Spearman = 1");
+        assert_eq!(m.data[0][1], m.data[1][0], "symmetric");
+        assert!(m.data[0][2].abs() < 0.3, "x~z near zero");
+    }
+
+    #[test]
+    fn correlation_matrix_omitted_with_fewer_than_two_numeric_columns() {
+        let df = df!["x" => [1.0f64, 2.0], "s" => ["a", "b"]].unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Synth, 1000).expect("report");
+        assert!(report.correlation_matrix.is_none());
+    }
+
+    #[test]
+    fn correlation_handles_nulls_and_nan_without_panicking() {
+        let x = df!["x" => [Some(1.0f64), Some(2.0), None, Some(f64::NAN), Some(4.0), Some(5.0)],
+                    "y" => [Some(2.0f64), Some(4.0), Some(1.0), Some(3.0), None, Some(10.0)]]
+        .unwrap();
+        let report = build_report(&x, 100, ProfileDetail::Synth, 1000).expect("must not panic");
+        let m = report.correlation_matrix.as_ref().expect("matrix");
+        // Only rows where BOTH finite & present count: (1,2),(2,4),(5,10) → strong positive.
+        assert!(m.data[0][1] > 0.9, "got {}", m.data[0][1]);
+        assert!(m.data[0][1].is_finite());
+    }
+
+    #[test]
+    fn standard_detail_has_no_correlation_matrix() {
+        let df = df!["x" => [1.0f64, 2.0, 3.0], "y" => [3.0f64, 2.0, 1.0]].unwrap();
+        let report = build_report(&df, 100, ProfileDetail::Standard, 1000).expect("report");
+        assert!(report.correlation_matrix.is_none());
     }
 }
