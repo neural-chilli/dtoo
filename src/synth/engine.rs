@@ -1,6 +1,7 @@
 //! Synth orchestration: batch generation, FK fan-out, spec execution.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use polars::prelude::*;
 use rand::Rng;
@@ -50,6 +51,15 @@ pub struct TableGenContext<'a> {
 
 fn config_err(message: String) -> DtooError {
     DtooError::Config { message }
+}
+
+/// Formats an elapsed `Duration` as `[mm:ss.t]`, matching dtoo's house style.
+fn fmt_elapsed(start: &Instant) -> String {
+    let elapsed = start.elapsed();
+    let mins = elapsed.as_secs() / 60;
+    let secs = elapsed.as_secs() % 60;
+    let tenths = elapsed.subsec_millis() / 100;
+    format!("[{mins:02}:{secs:02}.{tenths}]")
 }
 
 fn is_temporal(dt: &DataType) -> bool {
@@ -237,7 +247,18 @@ fn generate_key_series(
         };
         let values: Vec<i64> = (0..rows).map(|i| start + (offset + i) as i64).collect();
         let base = Series::new(col.name.as_str().into(), values);
-        return Ok(base.cast(&col.dtype).unwrap_or(base));
+        return Ok(match base.cast(&col.dtype) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!(
+                    "Warning: column `{}` could not be cast to {:?}; keeping {:?}",
+                    col.name,
+                    col.dtype,
+                    base.dtype()
+                );
+                base
+            }
+        });
     }
     let values: Vec<String> = (0..rows)
         .map(|i| keys::key_string(&kind, offset + i, rng))
@@ -499,20 +520,26 @@ fn run_single_mode(
 ) -> Result<(), DtooError> {
     use crate::output_writer::{OutputWriter, OutputWriterConfig};
 
+    let start = Instant::now();
     let profile = crate::synth::profile_input::load_profile(profile_path)?;
     let rows = args.rows.expect("CLI validation guarantees --rows");
     let seed = args.seed.unwrap_or(0);
 
     if args.dry_run {
+        let fmt_name = match args.output_format {
+            crate::cli::OutputFormat::Csv => "csv",
+            crate::cli::OutputFormat::Parquet => "parquet",
+            crate::cli::OutputFormat::Ndjson => "ndjson",
+        };
         eprintln!("Synth Plan\n==========");
         eprintln!("Seed: {seed}");
         eprintln!(
-            "  synth: {rows} rows -> {} ({:?})",
+            "  synth: {rows} rows -> {} (--output-format {})",
             args.output
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "stdout".to_string()),
-            args.output_format
+            fmt_name
         );
         return Ok(());
     }
@@ -530,7 +557,15 @@ fn run_single_mode(
     };
     let df = generate_table(engine, &ctx, rows, &rules, &ParentKeys::default())?;
     if args.verbose {
-        eprintln!("[1/1] synth — {} rows generated", df.height());
+        eprintln!(
+            "{} [1/1] synth — {} rows -> {}",
+            fmt_elapsed(&start),
+            df.height(),
+            args.output
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "stdout".to_string())
+        );
     }
 
     let writer = OutputWriter::new(OutputWriterConfig {
@@ -551,6 +586,7 @@ fn run_spec_mode(
     use crate::output_writer::{OutputWriter, OutputWriterConfig};
     use crate::synth::spec;
 
+    let start = Instant::now();
     let synth_spec = spec::load_spec(spec_path)?;
     spec::validate(&synth_spec)?;
     let order = spec::generation_order(&synth_spec)?;
@@ -614,7 +650,8 @@ fn run_spec_mode(
         let df = generate_table(engine, &ctx, table.rows, &rules, &parents)?;
         if args.verbose {
             eprintln!(
-                "[{}/{}] {name} — {} rows -> {}",
+                "{} [{}/{}] {name} — {} rows -> {}",
+                fmt_elapsed(&start),
                 i + 1,
                 order.len(),
                 df.height(),
@@ -956,5 +993,32 @@ mod tests {
         let err = generate_table(&engine, &ctx, 100, &rules, &ParentKeys::default())
             .expect_err("unsatisfiable");
         assert!(err.to_string().contains("v > 1000000"));
+    }
+
+    /// Spec 35: order is sample → constraints → derives.  A constraint that
+    /// references a derived column must fail (the derived column doesn't exist
+    /// yet at constraint-filter time) rather than panic or silently succeed.
+    #[test]
+    fn constraint_referencing_derived_column_returns_err() {
+        let profile = profile_of(vec![numeric_col("v")], None);
+        let ctx = TableGenContext {
+            name: "t",
+            profile: &profile,
+            keys: &[],
+            fks: &[],
+            seed: 42,
+        };
+        // derive produces `doubled`; constraint tries to reference it before
+        // it exists (constraints run before derives).
+        let rules = TableRules {
+            constraints: vec!["doubled > 0".to_string()],
+            derives: vec!["doubled = v * 2".to_string()],
+        };
+        let engine = crate::polars_engine::PolarsEngine::new();
+        let result = generate_table(&engine, &ctx, 10, &rules, &ParentKeys::default());
+        assert!(
+            result.is_err(),
+            "expected Err when constraint references a not-yet-derived column, got Ok"
+        );
     }
 }
