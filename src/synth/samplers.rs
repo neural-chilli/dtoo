@@ -61,7 +61,11 @@ pub fn histogram_quantile(buckets: &[HistogramBucket], u: f64) -> f64 {
 
 /// Maps a uniform u through a piecewise-linear CDF over [min,p25,median,p75,max].
 pub fn quantiles_quantile(q: &[f64], u: f64) -> f64 {
-    debug_assert_eq!(q.len(), 5);
+    assert_eq!(
+        q.len(),
+        5,
+        "quantiles_quantile requires exactly 5 quantile points"
+    );
     let u = u.clamp(0.0, 1.0);
     let seg = (u * 4.0).floor().min(3.0) as usize; // 0..=3
     let frac = u * 4.0 - seg as f64;
@@ -69,6 +73,13 @@ pub fn quantiles_quantile(q: &[f64], u: f64) -> f64 {
 }
 
 /// Picks an index into `values` weighted by frequency.
+///
+/// # Precondition
+///
+/// The slice must be non-empty; callers are responsible for guarding this.
+/// An empty slice (or one whose total frequency is zero) returns `0` as a
+/// non-panicking fallback, but that index is not valid to dereference and
+/// callers must not rely on it producing a meaningful value.
 pub fn sample_weighted_index(values: &[ValueFrequency], rng: &mut ChaCha8Rng) -> usize {
     let total: usize = values.iter().map(|v| v.freq).sum();
     if total == 0 || values.is_empty() {
@@ -116,7 +127,7 @@ pub fn generate_from_pattern(
             'a' => out.push((b'a' + rng.gen_range(0..26u8)) as char),
             'd' => out.push((b'0' + rng.gen_range(0..10u8)) as char),
             'N' => {
-                for _ in 0..run_lengths[run_idx].max(1) {
+                for _ in 0..run_lengths[run_idx] {
                     out.push((b'0' + rng.gen_range(0..10u8)) as char);
                 }
                 run_idx += 1;
@@ -252,5 +263,29 @@ mod tests {
         let mut rng = stream_rng(9, "t", "c", 0);
         let nulls = (0..10_000).filter(|_| is_null_draw(25.0, &mut rng)).count();
         assert!((2200..=2800).contains(&nulls), "≈25% nulls, got {nulls}");
+    }
+
+    #[test]
+    fn stream_rng_is_table_isolated() {
+        let mut t1 = stream_rng(42, "orders", "id", 0);
+        let mut t2 = stream_rng(42, "customers", "id", 0);
+        assert_ne!(
+            t1.r#gen::<u64>(),
+            t2.r#gen::<u64>(),
+            "same column name, different table → different stream"
+        );
+    }
+
+    #[test]
+    fn pattern_generation_distributes_multiple_runs() {
+        let mut rng = stream_rng(1, "t", "c", 0);
+        for _ in 0..100 {
+            // "NaN" = digit-run, letter, digit-run; fixed=1 (the 'a'); target length 3..=8
+            let s = generate_from_pattern("NaN", 3, 8, &mut rng);
+            assert!(s.len() >= 3 && s.len() <= 8, "len {} of {s}", s.len());
+            // exactly one lowercase letter, rest digits
+            assert_eq!(s.chars().filter(|c| c.is_ascii_alphabetic()).count(), 1);
+            assert!(s.chars().filter(|c| c.is_ascii_digit()).count() >= 2);
+        }
     }
 }
