@@ -10,11 +10,12 @@ use rand_chacha::ChaCha8Rng;
 use crate::{
     cli::SynthArgs,
     error::DtooError,
+    polars_engine::PolarsEngine,
     synth::{
         copula,
         keys::{self, KeyKind},
         profile_input::{SynthColumn, SynthProfile},
-        samplers,
+        rules, samplers,
         spec::FanOut,
     },
 };
@@ -399,6 +400,89 @@ fn generate_independent_series(
     Ok(Series::new(col.name.as_str().into(), values))
 }
 
+/// Rules attached to a table, pre-split by kind.
+pub struct TableRules {
+    pub constraints: Vec<String>,
+    pub derives: Vec<String>,
+}
+
+/// Generates a full table: oversample-and-filter under constraints (10%
+/// acceptance floor checked after 5 rounds), then derives, then truncation.
+pub fn generate_table(
+    engine: &PolarsEngine,
+    ctx: &TableGenContext,
+    rows: usize,
+    rules: &TableRules,
+    parents: &ParentKeys,
+) -> Result<DataFrame, DtooError> {
+    // rows: 0 is valid per the spec: empty output with the correct schema.
+    // A zero-row batch produces empty columns of the right dtypes.
+    if rows == 0 {
+        let empty = generate_batch(ctx, 0, 0, 0, parents)?;
+        return if rules.derives.is_empty() {
+            Ok(empty)
+        } else {
+            rules::apply_derives(engine, empty, &rules.derives)
+        };
+    }
+
+    let mut kept: Option<DataFrame> = None;
+    let mut kept_rows = 0usize;
+    let mut generated_rows = 0usize;
+    let mut worst: Option<(String, f64)> = None;
+    let mut round: u64 = 0;
+
+    while kept_rows < rows {
+        let remaining = rows - kept_rows;
+        let batch_rows = if rules.constraints.is_empty() {
+            remaining
+        } else {
+            (remaining * 3 / 2).max(1)
+        };
+        let batch = generate_batch(ctx, round, batch_rows, generated_rows, parents)?;
+        generated_rows += batch.height();
+
+        let filtered = if rules.constraints.is_empty() {
+            batch
+        } else {
+            let (f, counts) = rules::filter_constraints(engine, batch, &rules.constraints)?;
+            for (c, passed) in counts {
+                let rate = passed as f64 / batch_rows as f64;
+                if worst.as_ref().is_none_or(|(_, w)| rate < *w) {
+                    worst = Some((c, rate));
+                }
+            }
+            f
+        };
+        kept_rows += filtered.height();
+        kept = Some(match kept {
+            None => filtered,
+            Some(acc) => acc
+                .vstack(&filtered)
+                .map_err(|e| config_err(format!("accumulating batches: {e}")))?,
+        });
+
+        round += 1;
+        if kept_rows < rows && round >= 5 {
+            let acceptance = kept_rows as f64 / generated_rows as f64;
+            if acceptance < 0.10 {
+                let (constraint, rate) = worst.expect("constraints ran");
+                return Err(config_err(format!(
+                    "table `{}`: constraint `{constraint}` accepts only {:.1}% of generated rows after {round} rounds; it appears unsatisfiable against the profile",
+                    ctx.name,
+                    rate * 100.0
+                )));
+            }
+        }
+    }
+
+    let mut df = kept.unwrap_or_default().head(Some(rows));
+    if !rules.derives.is_empty() {
+        df = rules::apply_derives(engine, df, &rules.derives)?;
+    }
+    Ok(df)
+}
+
 /// Entry point for `dtoo synth` (filled in by the orchestration task).
 pub fn run(_args: &SynthArgs) -> Result<(), DtooError> {
     Err(DtooError::Config {
@@ -641,5 +725,48 @@ mod tests {
         }
         let r = c / (vx.sqrt() * vy.sqrt());
         assert!(r > 0.7, "expected strong positive correlation, got {r}");
+    }
+
+    #[test]
+    fn generate_table_satisfies_constraints_and_target_rows() {
+        let profile = profile_of(vec![numeric_col("v")], None);
+        let ctx = TableGenContext {
+            name: "t",
+            profile: &profile,
+            keys: &[],
+            fks: &[],
+            seed: 2,
+        };
+        let rules = TableRules {
+            constraints: vec!["v > 20".to_string()],
+            derives: vec!["doubled = v * 2".to_string()],
+        };
+        let engine = crate::polars_engine::PolarsEngine::new();
+        let df =
+            generate_table(&engine, &ctx, 300, &rules, &ParentKeys::default()).expect("generate");
+        assert_eq!(df.height(), 300);
+        let v = df.column("v").unwrap().f64().unwrap();
+        assert!(v.iter().flatten().all(|x| x > 20.0));
+        assert!(df.column("doubled").is_ok());
+    }
+
+    #[test]
+    fn impossible_constraint_fails_with_named_constraint() {
+        let profile = profile_of(vec![numeric_col("v")], None);
+        let ctx = TableGenContext {
+            name: "t",
+            profile: &profile,
+            keys: &[],
+            fks: &[],
+            seed: 2,
+        };
+        let rules = TableRules {
+            constraints: vec!["v > 1000000".to_string()],
+            derives: vec![],
+        };
+        let engine = crate::polars_engine::PolarsEngine::new();
+        let err = generate_table(&engine, &ctx, 100, &rules, &ParentKeys::default())
+            .expect_err("unsatisfiable");
+        assert!(err.to_string().contains("v > 1000000"));
     }
 }
