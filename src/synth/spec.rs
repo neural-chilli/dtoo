@@ -1,8 +1,5 @@
 //! Synth spec (YAML): schema, validation, and generation ordering.
 
-// Items are consumed by future tasks; suppress dead_code until then.
-#![allow(dead_code)]
-
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},

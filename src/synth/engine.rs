@@ -720,7 +720,6 @@ mod tests {
     ) -> SynthProfile {
         SynthProfile {
             synth_detail: true,
-            row_count: 100,
             columns,
             correlation,
         }

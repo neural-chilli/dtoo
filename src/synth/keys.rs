@@ -1,7 +1,5 @@
 //! Unique key synthesis formatted to match observed data.
 
-#![allow(dead_code)]
-
 use polars::prelude::DataType;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;

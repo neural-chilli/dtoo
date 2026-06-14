@@ -1,5 +1,4 @@
 //! Intra-row rules: constraint filtering and derived columns via Polars SQL.
-#![allow(dead_code)] // consumed by Task 14
 
 use polars::prelude::*;
 

@@ -2,8 +2,6 @@
 //! Matrices here are k×k for k profiled numeric columns — small — so the
 //! linear algebra is implemented in-module rather than adding a crate.
 
-#![allow(dead_code)] // consumed by Task 12 (engine)
-
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 

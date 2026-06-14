@@ -1,7 +1,5 @@
 //! Deterministic seeded samplers for synthetic value generation.
 
-#![allow(dead_code)]
-
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sha2::{Digest, Sha256};

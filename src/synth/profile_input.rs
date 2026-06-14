@@ -1,7 +1,5 @@
 //! Loads dtoo profile JSON into the model the synth engine consumes.
 
-#![allow(dead_code)]
-
 use std::path::Path;
 
 use chrono::{NaiveDate, NaiveDateTime};
@@ -16,7 +14,6 @@ use crate::{
 #[derive(Debug)]
 pub struct SynthProfile {
     pub synth_detail: bool,
-    pub row_count: usize,
     pub columns: Vec<SynthColumn>,
     pub correlation: Option<CorrelationMatrix>,
 }
@@ -156,7 +153,6 @@ pub fn load_profile(path: &Path) -> Result<SynthProfile, DtooError> {
 
     Ok(SynthProfile {
         synth_detail,
-        row_count: report.row_count,
         columns,
         correlation: report.correlation_matrix.clone(),
     })
