@@ -49,6 +49,8 @@ pub fn detect_key_kind(col: &SynthColumn) -> KeyKind {
 /// stream order, pattern keys replace their last digit run with the index.
 pub fn key_string(kind: &KeyKind, index: usize, rng: &mut ChaCha8Rng) -> String {
     match kind {
+        // NOTE: SequentialInt keys are emitted directly as an i64 Series in the
+        // engine (see is_numeric_kind); this arm exists for completeness.
         KeyKind::SequentialInt { start } => (start + index as i64).to_string(),
         KeyKind::PaddedDigits { width } => format!("{:0width$}", index + 1, width = width),
         KeyKind::UuidLike => {
@@ -60,13 +62,19 @@ pub fn key_string(kind: &KeyKind, index: usize, rng: &mut ChaCha8Rng) -> String 
         }
         KeyKind::PatternCounter { pattern } => {
             let idx_str = (index + 1).to_string();
-            // Replace the LAST digit-run token with the padded index; if the
-            // pattern has no digit run, append the index.
-            if let Some(pos) = pattern.rfind('N') {
+            // Replace the LAST digit-run token with the index; if the pattern
+            // has no digit run, append the index. Use char_indices (byte
+            // offsets) consistently so multibyte pattern chars don't desync.
+            let last_n_byte = pattern
+                .char_indices()
+                .filter(|(_, c)| *c == 'N')
+                .map(|(byte_pos, _)| byte_pos)
+                .next_back();
+            if let Some(n_byte) = last_n_byte {
                 let mut out = String::new();
-                for (i, c) in pattern.chars().enumerate() {
+                for (byte_pos, c) in pattern.char_indices() {
                     match c {
-                        'N' if i == pos => out.push_str(&idx_str),
+                        'N' if byte_pos == n_byte => out.push_str(&idx_str),
                         'N' => out.push('0'),
                         'a' => out.push((b'a' + (index % 26) as u8) as char),
                         'd' => out.push('0'),
@@ -168,6 +176,20 @@ mod tests {
         for i in 0..1000 {
             let k = key_string(&kind, i, &mut rng);
             assert!(seen.insert(k.clone()), "duplicate key {k} at {i}");
+        }
+    }
+
+    #[test]
+    fn pattern_keys_with_non_ascii_are_unique() {
+        // A pattern containing a multibyte char before the N run (e.g. from
+        // source data like "café-0001"): byte offset != char index.
+        let c = col(DataType::String, "café-N", 8, 12, None);
+        let kind = detect_key_kind(&c);
+        let mut rng = stream_rng(1, "t", "k", 0);
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..1000 {
+            let k = key_string(&kind, i, &mut rng);
+            assert!(seen.insert(k.clone()), "duplicate key {k} at index {i}");
         }
     }
 }
