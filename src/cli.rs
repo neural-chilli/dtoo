@@ -24,6 +24,7 @@ pub enum Commands {
     Profile(ProfileArgs),
     Inspect(InspectArgs),
     Fingerprint(FingerprintArgs),
+    Synth(SynthArgs),
 }
 
 /// Arguments for `dtoo query`.
@@ -88,6 +89,12 @@ pub struct QueryArgs {
 
     #[arg(long = "profile-sample", default_value_t = 100)]
     pub profile_sample: u8,
+
+    #[arg(long = "profile-detail", default_value = "standard")]
+    pub profile_detail: ProfileDetail,
+
+    #[arg(long = "top-k", default_value_t = 1000)]
+    pub top_k: usize,
 
     #[arg(long)]
     pub limit: Option<usize>,
@@ -209,6 +216,12 @@ pub struct ProfileArgs {
     #[arg(long, default_value_t = 100)]
     pub sample: u8,
 
+    #[arg(long, default_value = "standard")]
+    pub detail: ProfileDetail,
+
+    #[arg(long = "top-k", default_value_t = 1000)]
+    pub top_k: usize,
+
     #[arg(long, default_value = ",")]
     pub delimiter: char,
 
@@ -270,6 +283,44 @@ pub struct FingerprintArgs {
     pub path: PathBuf,
 }
 
+/// Arguments for `dtoo synth`.
+#[derive(Debug, Parser)]
+#[command(about = "Generate synthetic data from one or more profiles")]
+pub struct SynthArgs {
+    #[arg(long)]
+    pub spec: Option<PathBuf>,
+
+    #[arg(long)]
+    pub profile: Option<PathBuf>,
+
+    #[arg(long)]
+    pub rows: Option<usize>,
+
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    #[arg(long = "output-format", default_value = "csv")]
+    pub output_format: OutputFormat,
+
+    #[arg(long, default_value = ",")]
+    pub delimiter: char,
+
+    #[arg(long)]
+    pub compress: Option<CompressMethod>,
+
+    #[arg(long = "no-header")]
+    pub no_header: bool,
+
+    #[arg(long)]
+    pub seed: Option<u64>,
+
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
+
+    #[arg(long)]
+    pub verbose: bool,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum PipeMode {
     File,
@@ -295,6 +346,16 @@ pub enum ProfileFormat {
     Json,
     Csv,
     Html,
+}
+
+/// Controls how much detail is included in a profile report.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum ProfileDetail {
+    /// Standard output: per-column statistics only (default).
+    #[default]
+    Standard,
+    /// Synth output: adds histograms, top-K values, unique ratios, and correlation matrix.
+    Synth,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -339,7 +400,36 @@ impl Cli {
                 .map_err(|message| Self::command().error(ErrorKind::ValueValidation, message))?;
         }
 
+        if let Commands::Synth(synth) = &cli.command {
+            synth
+                .validate()
+                .map_err(|message| Self::command().error(ErrorKind::ValueValidation, message))?;
+        }
+
         Ok(cli)
+    }
+}
+
+impl SynthArgs {
+    fn validate(&self) -> Result<(), String> {
+        match (&self.spec, &self.profile) {
+            (Some(_), Some(_)) => Err("--spec and --profile are mutually exclusive".to_string()),
+            (None, None) => Err("synth requires --spec or --profile".to_string()),
+            (Some(_), None) => {
+                if self.rows.is_some() || self.output.is_some() {
+                    Err("--rows and --output are only valid with --profile (spec mode reads them from the spec)".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            (None, Some(_)) => {
+                if self.rows.is_none() {
+                    Err("--profile mode requires --rows".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
     }
 }
 
@@ -1067,6 +1157,46 @@ verbose: false
     }
 
     #[test]
+    fn parses_profile_detail_and_top_k() {
+        let cli = parse([
+            "dtoo",
+            "profile",
+            "input.csv",
+            "--detail",
+            "synth",
+            "--top-k",
+            "500",
+        ]);
+        match cli.command {
+            Commands::Profile(args) => {
+                assert_eq!(args.detail, ProfileDetail::Synth);
+                assert_eq!(args.top_k, 500);
+            }
+            _ => panic!("expected profile command"),
+        }
+    }
+
+    #[test]
+    fn parses_query_profile_detail() {
+        let cli = parse([
+            "dtoo",
+            "query",
+            "input.csv",
+            "--profile",
+            "p.json",
+            "--profile-detail",
+            "synth",
+        ]);
+        match cli.command {
+            Commands::Query(args) => {
+                assert_eq!(args.profile_detail, ProfileDetail::Synth);
+                assert_eq!(args.top_k, 1000);
+            }
+            _ => panic!("expected query command"),
+        }
+    }
+
+    #[test]
     fn accepts_ref_and_lineage_values() {
         let cli = parse([
             "dtoo",
@@ -1086,6 +1216,59 @@ verbose: false
             }
             _ => panic!("expected query command"),
         }
+    }
+
+    #[test]
+    fn synth_requires_spec_or_profile() {
+        let err = parse_err(["dtoo", "synth"]);
+        assert!(err.to_string().contains("--spec or --profile"));
+    }
+
+    #[test]
+    fn synth_rejects_spec_and_profile_together() {
+        let err = parse_err(["dtoo", "synth", "--spec", "s.yaml", "--profile", "p.json"]);
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn synth_profile_mode_requires_rows() {
+        let err = parse_err(["dtoo", "synth", "--profile", "p.json"]);
+        assert!(err.to_string().contains("--rows"));
+    }
+
+    #[test]
+    fn synth_spec_mode_rejects_rows_and_output() {
+        let err = parse_err(["dtoo", "synth", "--spec", "s.yaml", "--rows", "10"]);
+        assert!(err.to_string().contains("--profile"));
+    }
+
+    #[test]
+    fn synth_parses_valid_invocations() {
+        let cli = parse([
+            "dtoo",
+            "synth",
+            "--profile",
+            "p.json",
+            "--rows",
+            "100",
+            "--seed",
+            "9",
+        ]);
+        match cli.command {
+            Commands::Synth(args) => {
+                assert_eq!(args.rows, Some(100));
+                assert_eq!(args.seed, Some(9));
+            }
+            _ => panic!("expected synth command"),
+        }
+        parse([
+            "dtoo",
+            "synth",
+            "--spec",
+            "s.yaml",
+            "--dry-run",
+            "--verbose",
+        ]);
     }
 
     fn parse<const N: usize>(args: [&str; N]) -> Cli {

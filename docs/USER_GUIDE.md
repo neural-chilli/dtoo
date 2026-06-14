@@ -296,6 +296,79 @@ At a high level:
 - Partial success (`--on-error skip`): warnings plus summary
 - Failure: configuration, SQL, or IO errors stop execution
 
+## Synthetic data
+
+Generate realistic, privacy-preserving synthetic data from profiles of real
+sources. The profile JSON is the only artifact you need — profile inside a
+secure environment, generate anywhere.
+
+### 1. Profile the real data at synth detail
+
+```bash
+dtoo profile real/customers.csv --detail synth --output profiles/customers.json
+dtoo profile real/orders.csv   --detail synth --output profiles/orders.json
+```
+
+Synth detail adds histograms, top-K value frequencies (`--top-k`, default
+1000), unique ratios, and a Spearman correlation matrix. It requires JSON
+format (`--format json`). Standard profiles also work for generation, with
+reduced fidelity (a warning is emitted).
+
+### 2a. Quick single-table generation
+
+```bash
+dtoo synth --profile profiles/customers.json --rows 100000 --seed 42 \
+  --output synth/customers.parquet --output-format parquet
+```
+
+### 2b. Multi-table generation with referential integrity
+
+Write a spec YAML that declares generation order, key columns, foreign keys, and
+intra-row rules:
+
+```yaml
+# synth.yaml
+seed: 42
+tables:
+  customers:
+    profile: profiles/customers.json
+    rows: 10000
+    keys: [customer_id]
+    output: synth/customers.parquet
+  orders:
+    profile: profiles/orders.json
+    rows: 250000
+    foreign_keys:
+      - column: customer_id
+        references: customers.customer_id
+        fan_out: from_profile      # realistic orders-per-customer skew
+    rules:
+      - constraint: "amount > 0"
+      - derive: "total = quantity * unit_price"
+    output: synth/orders.parquet
+```
+
+Preview the plan, then generate:
+
+```bash
+dtoo synth --spec synth.yaml --dry-run    # show the plan, write nothing
+dtoo synth --spec synth.yaml --verbose    # generate with progress on stderr
+```
+
+### Guarantees
+
+- **Reproducible:** same spec + same seed produces byte-identical output.
+- **FK integrity:** every foreign key value exists in its parent table's key column.
+- **Constraints hold:** intra-row `constraint` rules filter the generated batch;
+  rows that cannot satisfy a constraint after repeated oversampling cause a
+  named error.
+- **Copula correlations:** numeric correlations captured in the profile are
+  preserved via a Gaussian copula, so column relationships remain realistic.
+- **Spec-relative paths:** `profile` and `output` paths in the spec are resolved
+  relative to the spec file, not the working directory.
+- **Scale:** practical ceiling is approximately 10 million rows per table
+  (in-memory generation via Polars).
+
 ## Additional References
 
 - Architecture and full spec: [DESIGN.md](DESIGN.md)

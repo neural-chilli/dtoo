@@ -557,6 +557,8 @@ impl<'a> QueryPipelineRunner<'a> {
                 path: profile_path.clone(),
                 format: self.args.profile_format,
                 sample_percentage: self.args.profile_sample,
+                detail: self.args.profile_detail,
+                top_k: self.args.top_k,
             },
         )
     }
@@ -1047,6 +1049,8 @@ mod tests {
             allow_plaintext_pii: false,
             encrypt_output_profile: None,
             encrypt_columns: None,
+            profile_detail: crate::cli::ProfileDetail::Standard,
+            top_k: 1000,
         };
 
         QueryPipeline::run(&args).expect("pipeline should run");
@@ -1107,6 +1111,8 @@ mod tests {
             allow_plaintext_pii: false,
             encrypt_output_profile: None,
             encrypt_columns: None,
+            profile_detail: crate::cli::ProfileDetail::Standard,
+            top_k: 1000,
         };
 
         QueryPipeline::run(&args).expect("pipeline should run");
@@ -1169,6 +1175,8 @@ mod tests {
             allow_plaintext_pii: false,
             encrypt_output_profile: None,
             encrypt_columns: None,
+            profile_detail: crate::cli::ProfileDetail::Standard,
+            top_k: 1000,
         };
 
         QueryPipeline::run(&args).expect("pipeline should run");
@@ -1228,6 +1236,8 @@ mod tests {
             allow_plaintext_pii: false,
             encrypt_output_profile: None,
             encrypt_columns: None,
+            profile_detail: crate::cli::ProfileDetail::Standard,
+            top_k: 1000,
         };
 
         QueryPipeline::run(&args).expect("pipeline should run");
@@ -1288,6 +1298,8 @@ mod tests {
             allow_plaintext_pii: false,
             encrypt_output_profile: None,
             encrypt_columns: None,
+            profile_detail: crate::cli::ProfileDetail::Standard,
+            top_k: 1000,
         };
 
         QueryPipeline::run(&args).expect("pipeline should run");
@@ -1348,6 +1360,8 @@ mod tests {
             allow_plaintext_pii: false,
             encrypt_output_profile: None,
             encrypt_columns: None,
+            profile_detail: crate::cli::ProfileDetail::Standard,
+            top_k: 1000,
         };
 
         QueryPipeline::run(&args).expect("pipeline should run");
@@ -1412,6 +1426,8 @@ mod tests {
             allow_plaintext_pii: false,
             encrypt_output_profile: None,
             encrypt_columns: None,
+            profile_detail: crate::cli::ProfileDetail::Standard,
+            top_k: 1000,
         };
 
         QueryPipeline::run(&args).expect("pipeline should run");
@@ -1469,6 +1485,8 @@ mod tests {
             allow_plaintext_pii: false,
             encrypt_output_profile: None,
             encrypt_columns: None,
+            profile_detail: crate::cli::ProfileDetail::Standard,
+            top_k: 1000,
         };
 
         QueryPipeline::run(&args).expect("pipeline should run");
@@ -1523,6 +1541,8 @@ mod tests {
             allow_plaintext_pii: false,
             encrypt_output_profile: None,
             encrypt_columns: None,
+            profile_detail: crate::cli::ProfileDetail::Standard,
+            top_k: 1000,
         };
 
         QueryPipeline::run(&args).expect("pipeline should run");
@@ -1586,6 +1606,8 @@ mod tests {
             allow_plaintext_pii: false,
             encrypt_output_profile: None,
             encrypt_columns: None,
+            profile_detail: crate::cli::ProfileDetail::Standard,
+            top_k: 1000,
         };
 
         let err = QueryPipeline::run(&args).expect_err("expect-at-least should fail");
@@ -1701,6 +1723,8 @@ mod tests {
             allow_plaintext_pii: false,
             encrypt_output_profile: None,
             encrypt_columns: None,
+            profile_detail: crate::cli::ProfileDetail::Standard,
+            top_k: 1000,
         }
     }
 
