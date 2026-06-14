@@ -90,6 +90,12 @@ pub struct QueryArgs {
     #[arg(long = "profile-sample", default_value_t = 100)]
     pub profile_sample: u8,
 
+    #[arg(long = "profile-detail", default_value = "standard")]
+    pub profile_detail: ProfileDetail,
+
+    #[arg(long = "top-k", default_value_t = 1000)]
+    pub top_k: usize,
+
     #[arg(long)]
     pub limit: Option<usize>,
 
@@ -209,6 +215,12 @@ pub struct ProfileArgs {
 
     #[arg(long, default_value_t = 100)]
     pub sample: u8,
+
+    #[arg(long, default_value = "standard")]
+    pub detail: ProfileDetail,
+
+    #[arg(long = "top-k", default_value_t = 1000)]
+    pub top_k: usize,
 
     #[arg(long, default_value = ",")]
     pub delimiter: char,
@@ -1112,6 +1124,46 @@ verbose: false
         }
 
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn parses_profile_detail_and_top_k() {
+        let cli = parse([
+            "dtoo",
+            "profile",
+            "input.csv",
+            "--detail",
+            "synth",
+            "--top-k",
+            "500",
+        ]);
+        match cli.command {
+            Commands::Profile(args) => {
+                assert_eq!(args.detail, ProfileDetail::Synth);
+                assert_eq!(args.top_k, 500);
+            }
+            _ => panic!("expected profile command"),
+        }
+    }
+
+    #[test]
+    fn parses_query_profile_detail() {
+        let cli = parse([
+            "dtoo",
+            "query",
+            "input.csv",
+            "--profile",
+            "p.json",
+            "--profile-detail",
+            "synth",
+        ]);
+        match cli.command {
+            Commands::Query(args) => {
+                assert_eq!(args.profile_detail, ProfileDetail::Synth);
+                assert_eq!(args.top_k, 1000);
+            }
+            _ => panic!("expected query command"),
+        }
     }
 
     #[test]

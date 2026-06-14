@@ -47,6 +47,8 @@ pub fn run(args: &ConvertArgs) -> Result<(), crate::error::DtooError> {
         allow_plaintext_pii: args.allow_plaintext_pii,
         encrypt_output_profile: args.encrypt_profile.clone(),
         encrypt_columns: args.encrypt_columns.clone(),
+        profile_detail: crate::cli::ProfileDetail::Standard,
+        top_k: 1000,
     };
 
     if args.encrypt_profile.is_some() && args.encrypt_columns.is_none() {

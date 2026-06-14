@@ -81,3 +81,62 @@ fn inspect_unknown_extension_returns_error_exit_code() {
 
     let _ = fs::remove_file(bogus);
 }
+
+#[test]
+fn profile_detail_synth_emits_histogram_and_matrix() {
+    let input = temp_path("synth-detail-in", "csv");
+    let output = temp_path("synth-detail-out", "json");
+    let mut body = String::from("a,b\n");
+    for i in 0..100 {
+        body.push_str(&format!("{},{}\n", i, i * 2));
+    }
+    fs::write(&input, body).expect("write input");
+
+    let out = Command::new(dtoo_bin())
+        .args([
+            "profile",
+            input.to_string_lossy().as_ref(),
+            "--detail",
+            "synth",
+            "--output",
+            output.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run profile");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let json = fs::read_to_string(&output).expect("read profile");
+    assert!(json.contains("\"detail\": \"synth\""));
+    assert!(json.contains("\"histogram\""));
+    assert!(json.contains("\"unique_ratio\""));
+    assert!(json.contains("\"correlation_matrix\""));
+
+    let _ = fs::remove_file(input);
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn profile_detail_synth_rejects_html_format() {
+    let input = temp_path("synth-detail-html", "csv");
+    fs::write(&input, "a\n1\n").expect("write input");
+
+    let out = Command::new(dtoo_bin())
+        .args([
+            "profile",
+            input.to_string_lossy().as_ref(),
+            "--detail",
+            "synth",
+            "--format",
+            "html",
+        ])
+        .output()
+        .expect("run profile");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("JSON"));
+
+    let _ = fs::remove_file(input);
+}
