@@ -100,7 +100,7 @@ pub fn parse_reference(reference: &str) -> Result<FkRef, DtooError> {
             "foreign key reference `{reference}` must be in table.column form"
         )));
     };
-    if table.is_empty() || column.is_empty() {
+    if table.is_empty() || column.is_empty() || column.contains('.') {
         return Err(config_err(format!(
             "foreign key reference `{reference}` must be in table.column form"
         )));
@@ -135,6 +135,12 @@ pub fn validate(spec: &SynthSpec) -> Result<(), DtooError> {
     for (name, table) in &spec.tables {
         for fk in &table.foreign_keys {
             let r = parse_reference(&fk.references)?;
+            if r.table == *name {
+                return Err(config_err(format!(
+                    "table `{name}` has a foreign key referencing itself (`{}`); self-referential foreign keys are not supported",
+                    fk.references
+                )));
+            }
             let Some(parent) = spec.tables.get(&r.table) else {
                 return Err(config_err(format!(
                     "table `{name}` foreign key references unknown target `{}`",
@@ -145,6 +151,12 @@ pub fn validate(spec: &SynthSpec) -> Result<(), DtooError> {
                 return Err(config_err(format!(
                     "table `{name}` foreign key references `{}`, which is not listed in `{}`'s keys",
                     fk.references, r.table
+                )));
+            }
+            if table.keys.contains(&fk.column) {
+                return Err(config_err(format!(
+                    "table `{name}` column `{}` is listed as both a key and a foreign key",
+                    fk.column
                 )));
             }
             fan_out(fk)?;
@@ -172,23 +184,21 @@ pub fn generation_order(spec: &SynthSpec) -> Result<Vec<String>, DtooError> {
         deps.insert(name, parents);
     }
     let mut order = Vec::new();
-    let mut done: Vec<String> = Vec::new();
     while order.len() < spec.tables.len() {
         let mut progressed = false;
         for (name, parents) in &deps {
-            if done.iter().any(|d| d == name) {
+            if order.iter().any(|d| d == name) {
                 continue;
             }
-            if parents.iter().all(|p| done.iter().any(|d| d == p)) {
+            if parents.iter().all(|p| order.iter().any(|d| d == p)) {
                 order.push(name.to_string());
-                done.push(name.to_string());
                 progressed = true;
             }
         }
         if !progressed {
             let remaining: Vec<&str> = deps
                 .keys()
-                .filter(|n| !done.iter().any(|d| d == **n))
+                .filter(|n| !order.iter().any(|d| d == **n))
                 .copied()
                 .collect();
             return Err(config_err(format!(
@@ -324,6 +334,102 @@ tables:
         let spec: SynthSpec = serde_yaml::from_str(yaml).expect("parse");
         let err = validate(&spec).expect_err("invalid rule");
         assert!(err.to_string().contains("exactly one"));
+    }
+
+    #[test]
+    fn rejects_self_referential_foreign_key() {
+        let yaml = r#"
+tables:
+  t:
+    profile: t.json
+    rows: 10
+    keys: [id]
+    foreign_keys:
+      - column: parent_id
+        references: t.id
+    output: t.csv
+"#;
+        let spec: SynthSpec = serde_yaml::from_str(yaml).expect("parse");
+        let err = validate(&spec).expect_err("self-ref");
+        assert!(err.to_string().contains("itself"));
+    }
+
+    #[test]
+    fn rejects_three_part_reference() {
+        let err = parse_reference("a.b.c").expect_err("3-part");
+        assert!(err.to_string().contains("table.column"));
+    }
+
+    #[test]
+    fn rejects_column_that_is_both_key_and_foreign_key() {
+        let yaml = r#"
+tables:
+  parent:
+    profile: p.json
+    rows: 10
+    keys: [id]
+    output: p.csv
+  child:
+    profile: c.json
+    rows: 10
+    keys: [shared]
+    foreign_keys:
+      - column: shared
+        references: parent.id
+    output: c.csv
+"#;
+        let spec: SynthSpec = serde_yaml::from_str(yaml).expect("parse");
+        let err = validate(&spec).expect_err("key+fk conflict");
+        assert!(err.to_string().contains("both a key and a foreign key"));
+    }
+
+    #[test]
+    fn parses_bare_string_uniform_fan_out() {
+        let yaml = r#"
+tables:
+  c:
+    profile: c.json
+    rows: 10
+    keys: [id]
+    output: c.csv
+  o:
+    profile: o.json
+    rows: 10
+    foreign_keys:
+      - column: cid
+        references: c.id
+        fan_out: uniform
+    output: o.csv
+"#;
+        let spec: SynthSpec = serde_yaml::from_str(yaml).expect("parse");
+        validate(&spec).expect("valid");
+        assert!(matches!(
+            fan_out(&spec.tables["o"].foreign_keys[0]).unwrap(),
+            FanOut::Uniform
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_fan_out_string() {
+        let yaml = r#"
+tables:
+  c:
+    profile: c.json
+    rows: 10
+    keys: [id]
+    output: c.csv
+  o:
+    profile: o.json
+    rows: 10
+    foreign_keys:
+      - column: cid
+        references: c.id
+        fan_out: wibble
+    output: o.csv
+"#;
+        let spec: SynthSpec = serde_yaml::from_str(yaml).expect("parse");
+        let err = validate(&spec).expect_err("bad fan_out");
+        assert!(err.to_string().contains("wibble"));
     }
 
     #[test]
