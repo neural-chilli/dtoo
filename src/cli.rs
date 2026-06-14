@@ -285,6 +285,7 @@ pub struct FingerprintArgs {
 
 /// Arguments for `dtoo synth`.
 #[derive(Debug, Parser)]
+#[command(about = "Generate synthetic data from one or more profiles")]
 pub struct SynthArgs {
     #[arg(long)]
     pub spec: Option<PathBuf>,
@@ -399,7 +400,36 @@ impl Cli {
                 .map_err(|message| Self::command().error(ErrorKind::ValueValidation, message))?;
         }
 
+        if let Commands::Synth(synth) = &cli.command {
+            synth
+                .validate()
+                .map_err(|message| Self::command().error(ErrorKind::ValueValidation, message))?;
+        }
+
         Ok(cli)
+    }
+}
+
+impl SynthArgs {
+    fn validate(&self) -> Result<(), String> {
+        match (&self.spec, &self.profile) {
+            (Some(_), Some(_)) => Err("--spec and --profile are mutually exclusive".to_string()),
+            (None, None) => Err("synth requires --spec or --profile".to_string()),
+            (Some(_), None) => {
+                if self.rows.is_some() || self.output.is_some() {
+                    Err("--rows and --output are only valid with --profile (spec mode reads them from the spec)".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            (None, Some(_)) => {
+                if self.rows.is_none() {
+                    Err("--profile mode requires --rows".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
     }
 }
 
@@ -1186,6 +1216,59 @@ verbose: false
             }
             _ => panic!("expected query command"),
         }
+    }
+
+    #[test]
+    fn synth_requires_spec_or_profile() {
+        let err = parse_err(["dtoo", "synth"]);
+        assert!(err.to_string().contains("--spec or --profile"));
+    }
+
+    #[test]
+    fn synth_rejects_spec_and_profile_together() {
+        let err = parse_err(["dtoo", "synth", "--spec", "s.yaml", "--profile", "p.json"]);
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn synth_profile_mode_requires_rows() {
+        let err = parse_err(["dtoo", "synth", "--profile", "p.json"]);
+        assert!(err.to_string().contains("--rows"));
+    }
+
+    #[test]
+    fn synth_spec_mode_rejects_rows_and_output() {
+        let err = parse_err(["dtoo", "synth", "--spec", "s.yaml", "--rows", "10"]);
+        assert!(err.to_string().contains("--profile"));
+    }
+
+    #[test]
+    fn synth_parses_valid_invocations() {
+        let cli = parse([
+            "dtoo",
+            "synth",
+            "--profile",
+            "p.json",
+            "--rows",
+            "100",
+            "--seed",
+            "9",
+        ]);
+        match cli.command {
+            Commands::Synth(args) => {
+                assert_eq!(args.rows, Some(100));
+                assert_eq!(args.seed, Some(9));
+            }
+            _ => panic!("expected synth command"),
+        }
+        parse([
+            "dtoo",
+            "synth",
+            "--spec",
+            "s.yaml",
+            "--dry-run",
+            "--verbose",
+        ]);
     }
 
     fn parse<const N: usize>(args: [&str; N]) -> Cli {

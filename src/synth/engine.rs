@@ -1,5 +1,4 @@
 //! Synth orchestration: batch generation, FK fan-out, spec execution.
-#![allow(dead_code)] // generate_batch and helpers consumed by Tasks 13/14
 
 use std::collections::HashMap;
 
@@ -483,11 +482,201 @@ pub fn generate_table(
     Ok(df)
 }
 
-/// Entry point for `dtoo synth` (filled in by the orchestration task).
-pub fn run(_args: &SynthArgs) -> Result<(), DtooError> {
-    Err(DtooError::Config {
-        message: "synth is not implemented yet".to_string(),
-    })
+/// Entry point for `dtoo synth`.
+pub fn run(args: &SynthArgs) -> Result<(), DtooError> {
+    let engine = PolarsEngine::new();
+    match (&args.spec, &args.profile) {
+        (Some(spec_path), None) => run_spec_mode(&engine, args, spec_path),
+        (None, Some(profile_path)) => run_single_mode(&engine, args, profile_path),
+        _ => unreachable!("CLI validation enforces exactly one mode"),
+    }
+}
+
+fn run_single_mode(
+    engine: &PolarsEngine,
+    args: &SynthArgs,
+    profile_path: &std::path::Path,
+) -> Result<(), DtooError> {
+    use crate::output_writer::{OutputWriter, OutputWriterConfig};
+
+    let profile = crate::synth::profile_input::load_profile(profile_path)?;
+    let rows = args.rows.expect("CLI validation guarantees --rows");
+    let seed = args.seed.unwrap_or(0);
+
+    if args.dry_run {
+        eprintln!("Synth Plan\n==========");
+        eprintln!("Seed: {seed}");
+        eprintln!(
+            "  synth: {rows} rows -> {} ({:?})",
+            args.output
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "stdout".to_string()),
+            args.output_format
+        );
+        return Ok(());
+    }
+
+    let ctx = TableGenContext {
+        name: "synth",
+        profile: &profile,
+        keys: &[],
+        fks: &[],
+        seed,
+    };
+    let rules = TableRules {
+        constraints: vec![],
+        derives: vec![],
+    };
+    let df = generate_table(engine, &ctx, rows, &rules, &ParentKeys::default())?;
+    if args.verbose {
+        eprintln!("[1/1] synth — {} rows generated", df.height());
+    }
+
+    let writer = OutputWriter::new(OutputWriterConfig {
+        output: args.output.clone(),
+        format: export_format(args.output_format),
+        header: !args.no_header,
+        delimiter: args.delimiter,
+        compression: args.compress.map(compression_codec),
+    });
+    writer.write(engine, df)
+}
+
+fn run_spec_mode(
+    engine: &PolarsEngine,
+    args: &SynthArgs,
+    spec_path: &std::path::Path,
+) -> Result<(), DtooError> {
+    use crate::output_writer::{OutputWriter, OutputWriterConfig};
+    use crate::synth::spec;
+
+    let synth_spec = spec::load_spec(spec_path)?;
+    spec::validate(&synth_spec)?;
+    let order = spec::generation_order(&synth_spec)?;
+    let seed = args.seed.unwrap_or(synth_spec.seed);
+    let base_dir = spec_path.parent().unwrap_or(std::path::Path::new("."));
+
+    if args.dry_run {
+        eprintln!("Synth Plan\n==========");
+        eprintln!("Seed: {seed}");
+        eprintln!("Generation order: {}", order.join(", "));
+        for name in &order {
+            let t = &synth_spec.tables[name];
+            let n_c = t.rules.iter().filter(|r| r.constraint.is_some()).count();
+            let n_d = t.rules.iter().filter(|r| r.derive.is_some()).count();
+            eprintln!(
+                "  {name}: {} rows -> {} ({} fks, {n_c} constraints, {n_d} derives)",
+                t.rows,
+                t.output.display(),
+                t.foreign_keys.len()
+            );
+        }
+        return Ok(());
+    }
+
+    let mut parents = ParentKeys::default();
+    for (i, name) in order.iter().enumerate() {
+        let table = &synth_spec.tables[name];
+        let profile = crate::synth::profile_input::load_profile(&base_dir.join(&table.profile))?;
+
+        let fks: Vec<ResolvedFk> = table
+            .foreign_keys
+            .iter()
+            .map(|fk| {
+                Ok(ResolvedFk {
+                    column: fk.column.clone(),
+                    parent_key: fk.references.clone(),
+                    fan_out: spec::fan_out(fk)?,
+                })
+            })
+            .collect::<Result<_, DtooError>>()?;
+        let rules = TableRules {
+            constraints: table
+                .rules
+                .iter()
+                .filter_map(|r| r.constraint.clone())
+                .collect(),
+            derives: table
+                .rules
+                .iter()
+                .filter_map(|r| r.derive.clone())
+                .collect(),
+        };
+
+        let ctx = TableGenContext {
+            name,
+            profile: &profile,
+            keys: &table.keys,
+            fks: &fks,
+            seed,
+        };
+        let df = generate_table(engine, &ctx, table.rows, &rules, &parents)?;
+        if args.verbose {
+            eprintln!(
+                "[{}/{}] {name} — {} rows -> {}",
+                i + 1,
+                order.len(),
+                df.height(),
+                table.output.display()
+            );
+        }
+
+        // Retain key columns referenced by children.
+        for key in &table.keys {
+            if let Ok(col) = df.column(key) {
+                parents.insert(
+                    format!("{name}.{key}"),
+                    col.as_materialized_series().clone(),
+                );
+            }
+        }
+
+        let output = base_dir.join(&table.output);
+        let format = match table.output_format.as_deref() {
+            Some("csv") => crate::types::ExportFormat::Csv,
+            Some("parquet") => crate::types::ExportFormat::Parquet,
+            Some("ndjson") => crate::types::ExportFormat::Ndjson,
+            Some(other) => {
+                return Err(config_err(format!(
+                    "table `{name}`: output_format must be csv, parquet, or ndjson, got `{other}`"
+                )));
+            }
+            None => infer_format(&output),
+        };
+        let writer = OutputWriter::new(OutputWriterConfig {
+            output: Some(output),
+            format,
+            header: true,
+            delimiter: ',',
+            compression: None,
+        });
+        writer.write(engine, df)?;
+    }
+    Ok(())
+}
+
+fn export_format(f: crate::cli::OutputFormat) -> crate::types::ExportFormat {
+    match f {
+        crate::cli::OutputFormat::Csv => crate::types::ExportFormat::Csv,
+        crate::cli::OutputFormat::Parquet => crate::types::ExportFormat::Parquet,
+        crate::cli::OutputFormat::Ndjson => crate::types::ExportFormat::Ndjson,
+    }
+}
+
+fn compression_codec(c: crate::cli::CompressMethod) -> crate::types::CompressionCodec {
+    match c {
+        crate::cli::CompressMethod::Gzip => crate::types::CompressionCodec::Gzip,
+        crate::cli::CompressMethod::Zstd => crate::types::CompressionCodec::Zstd,
+    }
+}
+
+fn infer_format(path: &std::path::Path) -> crate::types::ExportFormat {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("parquet") => crate::types::ExportFormat::Parquet,
+        Some("ndjson") | Some("jsonl") => crate::types::ExportFormat::Ndjson,
+        _ => crate::types::ExportFormat::Csv,
+    }
 }
 
 #[cfg(test)]
