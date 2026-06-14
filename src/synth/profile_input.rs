@@ -62,12 +62,12 @@ pub fn parse_dtype(s: &str) -> DataType {
         "Date" => DataType::Date,
         "Time" => DataType::Time,
         s if s.starts_with("Datetime") => {
-            let unit = if s.contains("Nanoseconds") {
+            let unit = if s.contains("'ns'") {
                 TimeUnit::Nanoseconds
-            } else if s.contains("Milliseconds") {
+            } else if s.contains("'ms'") {
                 TimeUnit::Milliseconds
             } else {
-                TimeUnit::Microseconds
+                TimeUnit::Microseconds // "'μs'", "'us'", or anything unrecognized
             };
             DataType::Datetime(unit, None)
         }
@@ -127,11 +127,7 @@ pub fn load_profile(path: &Path) -> Result<SynthProfile, DtooError> {
         .map(|c| {
             let dtype = parse_dtype(&c.data_type);
             let quantiles = build_quantiles(&dtype, c);
-            let parse_len = |v: &Option<String>| {
-                v.as_deref()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .map(|f| f as usize)
-            };
+            let parse_len = |v: &Option<String>| v.as_deref().and_then(|s| s.parse::<usize>().ok());
             SynthColumn {
                 name: c.name.clone(),
                 dtype,
@@ -204,15 +200,35 @@ mod tests {
         assert_eq!(parse_dtype("Boolean"), DataType::Boolean);
         assert_eq!(parse_dtype("Date"), DataType::Date);
         assert!(matches!(
-            parse_dtype("Datetime(Microseconds, None)"),
+            parse_dtype("Datetime('μs')"),
             DataType::Datetime(_, _)
         ));
         assert!(matches!(
-            parse_dtype("Decimal(Some(10), Some(2))"),
+            parse_dtype("Decimal(10, 2)"),
             DataType::Decimal(_, _)
         ));
         // Unknown dtypes degrade to String (pattern sampling).
         assert_eq!(parse_dtype("List(Int64)"), DataType::String);
+    }
+
+    #[test]
+    fn parses_datetime_time_units_from_debug_strings() {
+        assert!(matches!(
+            parse_dtype("Datetime('ns')"),
+            DataType::Datetime(TimeUnit::Nanoseconds, _)
+        ));
+        assert!(matches!(
+            parse_dtype("Datetime('us')"),
+            DataType::Datetime(TimeUnit::Microseconds, _)
+        ));
+        assert!(matches!(
+            parse_dtype("Datetime('μs')"),
+            DataType::Datetime(TimeUnit::Microseconds, _)
+        ));
+        assert!(matches!(
+            parse_dtype("Datetime('ms')"),
+            DataType::Datetime(TimeUnit::Milliseconds, _)
+        ));
     }
 
     #[test]
