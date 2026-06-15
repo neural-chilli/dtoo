@@ -922,8 +922,10 @@ fn write_manifest_if_requested(
 /// Apply the optional `--where` and `--filter-sql` stages to a single file's
 /// LazyFrame, preserving the original where-before-filter ordering.
 ///
-/// `--where` runs first (as `SELECT * FROM _ WHERE …` with no refs available),
-/// then `--filter-sql` runs against the result with reference tables registered.
+/// `--where` runs first (as `SELECT * FROM _ WHERE …`), then `--filter-sql`
+/// runs against the result. Reference tables are registered for both stages, so
+/// a `--where` subquery like `id IN (SELECT id FROM regions)` resolves, matching
+/// DESIGN.md's guarantee that refs are available in all SQL contexts.
 fn per_file_filter(
     engine: &PolarsEngine,
     lf: LazyFrame,
@@ -934,11 +936,11 @@ fn per_file_filter(
     match (where_clause, filter_sql) {
         (None, None) => Ok(lf),
         (Some(where_sql), None) => {
-            engine.run_sql(lf, &[], &format!("SELECT * FROM _ WHERE {where_sql}"))
+            engine.run_sql(lf, refs, &format!("SELECT * FROM _ WHERE {where_sql}"))
         }
         (None, Some(filter)) => engine.run_sql(lf, refs, filter),
         (Some(where_sql), Some(filter)) => {
-            let pre = engine.run_sql(lf, &[], &format!("SELECT * FROM _ WHERE {where_sql}"))?;
+            let pre = engine.run_sql(lf, refs, &format!("SELECT * FROM _ WHERE {where_sql}"))?;
             engine.run_sql(pre, refs, filter)
         }
     }

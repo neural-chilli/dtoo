@@ -22,6 +22,38 @@ fn temp_path(prefix: &str, ext: &str) -> PathBuf {
 }
 
 #[test]
+fn where_clause_can_reference_a_ref_table_subquery() {
+    // DESIGN.md: reference tables are available by name in all SQL contexts,
+    // including --where. Repro from review: a subquery against a --ref table.
+    let input = temp_path("where-ref-in", "csv");
+    let regions = temp_path("where-ref-regions", "csv");
+    fs::write(&input, "id,v\n1,10\n2,20\n3,30\n4,40\n").expect("write input");
+    fs::write(&regions, "id\n2\n4\n").expect("write regions");
+
+    let ref_arg = format!("regions={}", regions.display());
+    let output = Command::new(dtoo_bin())
+        .arg("query")
+        .arg(input.to_string_lossy().as_ref())
+        .arg("--ref")
+        .arg(&ref_arg)
+        .arg("--where")
+        .arg("id IN (SELECT id FROM regions)")
+        .arg("--count")
+        .output()
+        .expect("run dtoo query");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "2");
+
+    let _ = fs::remove_file(input);
+    let _ = fs::remove_file(regions);
+}
+
+#[test]
 fn query_count_outputs_rows_and_exit_zero() {
     let input = temp_path("count-input", "csv");
     fs::write(&input, "id\n1\n2\n3\n").expect("write input");
